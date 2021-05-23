@@ -196,7 +196,7 @@
 
 ##### CMS 并发收集器
 
-- `-XX:UseConcMarkSweepGC`老年代使用CMS垃圾收集器,新生代使用ParNew收集器
+- `-XX:+UseConcMarkSweepGC`老年代使用CMS垃圾收集器,新生代使用ParNew收集器
 - `-XX:CMSInitiatingOccupancyFraction`设置老年代使用多少空间时开始垃圾回收
 	- 如果设置的太高,不够内存分配,不能满足并发执行,就会冻结用户线程启动Serial Old收集器,停顿时间就会变长
 	- 如果内存增长缓慢可以设置高一些,如果内存增长很快就要设置低一些 默认92%
