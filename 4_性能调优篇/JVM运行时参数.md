@@ -104,9 +104,9 @@
 
 ##### 堆的-XX选项
 
-- `Xms100m` 设置堆内存初始化为100m,等同于`-XX:InitalHeapSize=100m`
-- `Xmx100m` 设置最大堆内存为100m,等同于`-XX:MaxHeapSize=100m`
-- `Xmn2g` 设置年轻代最大内存为2g,等同于`-XX:NewSize=2g`+`-XX:MaxNewSize=2g`
+- `-Xms100m` 设置堆内存初始化为100m,等同于`-XX:InitalHeapSize=100m`
+- `-Xmx100m` 设置最大堆内存为100m,等同于`-XX:MaxHeapSize=100m`
+- `-Xmn2g` 设置年轻代最大内存为2g,等同于`-XX:NewSize=2g`+`-XX:MaxNewSize=2g`
 
 - `-XX:+UseAdaptiveSizePolicy` 自动选择各区比例大小(默认开启)
 - `-XX:SurvivorRatio=8` 设置survivor:Eden占比为 1:1:8
