@@ -35,6 +35,9 @@
   - JVM运行时参数
   - GUI、命令行工具
   - 调优案例
+- JavaVirtualMachineHotSpot 案例源码
+  - Maven 
+  - jclasslib查看字节码
 
 
 
