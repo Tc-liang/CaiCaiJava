@@ -1,6 +1,4 @@
-package A_volatile;
-
-import org.junit.Test;
+package A_Volatile;
 
 /**
  * @Author: Caicai

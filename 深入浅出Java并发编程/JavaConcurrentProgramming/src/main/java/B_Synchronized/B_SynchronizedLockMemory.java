@@ -1,4 +1,4 @@
-package B_synchronized;
+package B_Synchronized;
 
 import org.junit.Test;
 import org.openjdk.jol.info.ClassLayout;

@@ -1,6 +1,4 @@
-package B_synchronized;
-
-import java.util.concurrent.locks.Condition;
+package B_Synchronized;
 
 /**
  * @Author: Caicai

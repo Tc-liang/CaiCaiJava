@@ -1,4 +1,4 @@
-package A_volatile;
+package A_Volatile;
 
 import sun.misc.Unsafe;
 

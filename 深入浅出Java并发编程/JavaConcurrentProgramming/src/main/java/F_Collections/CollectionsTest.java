@@ -6,6 +6,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * @Author: Caicai
@@ -30,5 +31,30 @@ public class CollectionsTest {
         }
 
         TimeUnit.SECONDS.sleep(3);
+    }
+
+    @Test
+    public void testConcurrentLinkedQueue()  {
+        ConcurrentLinkedQueue<String> queue = new ConcurrentLinkedQueue<>();
+
+        queue.offer("h1");
+        queue.offer("h2");
+        queue.offer("h3");
+
+        String p1 = queue.poll();
+        String p2 = queue.poll();
+        String p3 = queue.poll();
+        String p4 = queue.poll();
+
+        queue.offer("h4");
+        System.out.println(queue);
+    }
+
+    @Test
+    public void test(){
+        AtomicReference<String> reference = new AtomicReference<>();
+
+        reference = null;
+        System.out.println(reference.compareAndSet(null, null));
     }
 }
