@@ -49,7 +49,7 @@
 
   - 思维导图：.pos  .xmind .png
 
-    ![image.png](https://p9-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/1d6366a7010d4774ad89ae362d41c18a~tplv-k3u1fbpfcp-jj-mark:0:0:0:0:q75.image#?w=792&h=1202&s=92936&e=png&b=ffffff)
+    ![深入浅出Java虚拟机](README.assets/image-20240304220904091.png)
 
   
 
@@ -65,7 +65,7 @@
 
   - 思维导图：深入浅出构建Java并发编程知识体系（.pos 使用ProcessOn打开，.xmind使用XMind打开）
 
-    ![image.png](https://p9-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/754891971159455c84ee304e8901b6e2~tplv-k3u1fbpfcp-jj-mark:0:0:0:0:q75.image#?w=628&h=876&s=63470&e=png&b=ffffff)
+    ![深入浅出Java并发编程](README.assets/image-20240304221002296.png)
 
 
 
