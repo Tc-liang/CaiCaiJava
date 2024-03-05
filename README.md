@@ -40,7 +40,7 @@
     - 引用、垃圾回收算法
     - 垃圾收集器
 
-  - 性能调优🚀
+  - 性能调优篇🚀
 
     - 分析GC日志
     - JVM运行时参数
@@ -61,9 +61,9 @@
 
 - 笔记📔
 
-  - PDF笔记：深入浅出构建Java并发编程知识体系.pdf🎉
+  - PDF笔记：菜菜的Java进阶之路🚀深入浅出构建Java并发编程知识体系.pdf🎉
 
-  - 思维导图：深入浅出构建Java并发编程知识体系（.pos 使用ProcessOn打开，.xmind使用XMind打开）
+  - 思维导图：菜菜的Java进阶之路🚀深入浅出构建Java并发编程知识体系（.pos 使用ProcessOn打开，.xmind使用XMind打开）
 
     ![深入浅出Java并发编程](README.assets/image-20240304221002296.png)
 
@@ -71,7 +71,13 @@
 
 ####  MySQL进阶之路🐬
 
+笔记📔
 
+- PDF笔记：菜菜的Java进阶之路🚀MySQL进阶之路.pdf🎉
+
+- 思维导图：深入浅出构建Java并发编程知识体系（.pos .mm 使用ProcessOn打开）
+
+  ![image-20240305233144229](README.assets/image-20240305233144229.png)
 
 #### Effective Java 🛩️
 
