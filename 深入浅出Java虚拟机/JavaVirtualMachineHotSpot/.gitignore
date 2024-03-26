@@ -1,0 +1,9 @@
+### Example user template template
+### Example user template
+
+# IntelliJ project files
+../../深入浅出Java并发编程/JavaConcurrentProgramming/.idea
+*.iml
+out
+gen
+target

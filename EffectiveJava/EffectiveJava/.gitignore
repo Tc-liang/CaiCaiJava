@@ -2,7 +2,7 @@
 ### Example user template
 
 # IntelliJ project files
-.idea
+../../深入浅出Java并发编程/JavaConcurrentProgramming/.idea
 *.iml
 out
 gen
