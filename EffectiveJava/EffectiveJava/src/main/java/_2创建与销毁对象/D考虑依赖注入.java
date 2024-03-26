@@ -1,7 +1,7 @@
 package _2创建与销毁对象;
 
 /**
- * @author: cl
+ * @author: 菜菜的后端私房菜
  * @create: 2024/3/5 16:36
  * @description:
  */
