@@ -81,5 +81,9 @@
 
 #### Effective Java 🛩️
 
+- EffectiveJava：案例源码
+- 笔记📔
+  - PDF笔记：菜菜的Java进阶之路🚀EffectiveJava.pdf
+  - 思维导图：菜菜的Java进阶之路🚀EffectiveJava.pos
 
-
+![image-20240416164506366](README.assets/image-20240416164506366.png)
