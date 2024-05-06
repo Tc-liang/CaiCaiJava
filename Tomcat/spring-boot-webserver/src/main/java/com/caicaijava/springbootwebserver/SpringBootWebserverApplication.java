@@ -1,0 +1,13 @@
+package com.caicaijava.springbootwebserver;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class SpringBootWebserverApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(SpringBootWebserverApplication.class, args);
+	}
+
+}
