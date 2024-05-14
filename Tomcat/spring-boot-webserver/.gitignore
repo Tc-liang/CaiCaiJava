@@ -3,7 +3,10 @@ target/
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
-.mvn
+
+.mvn/
+mvnw
+mvnw.cmd
 
 ### STS ###
 .apt_generated
@@ -32,3 +35,4 @@ build/
 
 ### VS Code ###
 .vscode/
+/.mvn/

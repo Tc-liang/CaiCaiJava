@@ -14,12 +14,13 @@ import org.springframework.boot.web.servlet.server.ServletWebServerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+
 import javax.servlet.ServletException;
 import java.io.IOException;
 import java.util.Objects;
 
 /**
- * @author: cl
+ * @author: 菜菜的后端私房菜
  * @create: 2024/4/24 16:12
  * @description:
  */
@@ -65,29 +66,28 @@ public class WebServerConfig {
             @Override
             public void invoke(Request request, Response response) throws IOException, ServletException {
                 System.out.println("engine valve 扩展");
-
                 //记得继续调用
                 getNext().invoke(request, response);
             }
         });
-
 
         serverFactory.addContextValves(new ValveBase() {
             @Override
             public void invoke(Request request, Response response) throws IOException, ServletException {
                 System.out.println("context valve 扩展");
-
                 //记得继续调用
                 getNext().invoke(request, response);
             }
         });
 
+        //context容器 监听器
         serverFactory.addContextLifecycleListeners(event -> {
             System.out.println("context生命周期监听器:");
             System.out.println("type:" + event.getType());
             System.out.println("data:" + event.getData());
             System.out.println("life cycle:" + event.getLifecycle());
         });
+
         return serverFactory;
     }
 
