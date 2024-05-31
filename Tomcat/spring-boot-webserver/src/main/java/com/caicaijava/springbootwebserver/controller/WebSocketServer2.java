@@ -2,7 +2,10 @@ package com.caicaijava.springbootwebserver.controller;
 
 import org.springframework.stereotype.Component;
 
-import javax.websocket.*;
+import javax.websocket.OnClose;
+import javax.websocket.OnMessage;
+import javax.websocket.OnOpen;
+import javax.websocket.Session;
 import javax.websocket.server.PathParam;
 import javax.websocket.server.ServerEndpoint;
 import java.util.Map;
@@ -10,12 +13,12 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * @author: 菜菜的后端私房菜
- * @create: 2024/5/11 14:30
+ * @create: 2024/5/30 14:52
  * @description:
  */
-@ServerEndpoint("/ws/{id}")
+@ServerEndpoint("/ws2/{id}")
 @Component
-public class WebSocketServer {
+public class WebSocketServer2 {
 
     private static final Map<Long, Session> map = new ConcurrentHashMap<>();
 
@@ -39,3 +42,4 @@ public class WebSocketServer {
 
 
 }
+

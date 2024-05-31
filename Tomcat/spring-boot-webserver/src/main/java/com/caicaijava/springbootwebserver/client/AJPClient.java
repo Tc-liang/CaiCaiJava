@@ -1,4 +1,4 @@
-package com.caicaijava.springbootwebserver;
+package com.caicaijava.springbootwebserver.client;
 
 import com.github.jrialland.ajpclient.impl.CPingImpl;
 import com.github.jrialland.ajpclient.pool.Channels;

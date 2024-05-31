@@ -4,4 +4,9 @@ server:
     context-path: /caicai
 
   tomcat:
-    accept-count: 100
+    accept-count: 50
+    max-connections: 50
+    threads:
+      min-spare: 10
+      max: 200
+

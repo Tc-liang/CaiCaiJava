@@ -6,10 +6,13 @@ import org.apache.catalina.connector.Response;
 import org.apache.catalina.valves.ValveBase;
 import org.apache.coyote.ajp.AbstractAjpProtocol;
 import org.apache.coyote.ajp.AjpNio2Protocol;
-import org.apache.coyote.http11.Http11Nio2Protocol;
+import org.apache.coyote.http11.Http11NioProtocol;
+import org.apache.tomcat.util.threads.TaskQueue;
+import org.apache.tomcat.util.threads.ThreadPoolExecutor;
 import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory;
 import org.springframework.boot.web.embedded.tomcat.TomcatServletWebServerFactory;
 import org.springframework.boot.web.server.WebServerFactoryCustomizer;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.boot.web.servlet.server.ServletWebServerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -18,6 +21,7 @@ import org.springframework.context.annotation.Configuration;
 import javax.servlet.ServletException;
 import java.io.IOException;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @author: 菜菜的后端私房菜
@@ -33,11 +37,12 @@ public class WebServerConfig {
      * @return TomcatServletWebServerFactory
      */
     @Bean
-    public WebServerFactoryCustomizer<TomcatServletWebServerFactory> tomcatServletWebServerFactory() {
+    public WebServerFactoryCustomizer<TomcatServletWebServerFactory> myTomcatServletWebServerFactory() {
         return serverFactory -> {
             if (Objects.nonNull(serverFactory)) {
                 System.out.println("后置处理器增强工厂");
             }
+            System.out.println("6");
         };
     }
 
@@ -87,17 +92,29 @@ public class WebServerConfig {
             System.out.println("data:" + event.getData());
             System.out.println("life cycle:" + event.getLifecycle());
         });
-
         return serverFactory;
     }
 
 
     private Connector HTTPConnector() {
-        Connector connector = new Connector(new Http11Nio2Protocol());
+        Http11NioProtocol protocol = new Http11NioProtocol();
+        //设置网络通信参数
+        protocol.setAcceptCount(10);
+        protocol.setMaxConnections(30);
+
+        //设置线程池
+        ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(
+                10, 200,
+                60, TimeUnit.SECONDS,
+                new TaskQueue(5000));
+        protocol.setExecutor(threadPoolExecutor);
+
+        Connector connector = new Connector(protocol);
         connector.setScheme("http");
         connector.setPort(8888);
         connector.setAllowTrace(false);
         connector.setSecure(false);
+
         return connector;
     }
 
