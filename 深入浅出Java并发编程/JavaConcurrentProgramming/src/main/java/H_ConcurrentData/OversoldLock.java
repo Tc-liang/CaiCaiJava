@@ -114,8 +114,10 @@ public class OversoldLock {
 
     public boolean casBuy(int id, int count) {
         boolean res = false;
+        //最好提前预热，不要懒查询
         AtomicInteger stockAtomic = casMap.computeIfAbsent(id, k -> {
             //内存里没有就查库
+            //这里没加锁 可能导致重复查DB DB压力大
             int stock = selectStockCountByDB(id);
             return new AtomicInteger(stock);
         });
