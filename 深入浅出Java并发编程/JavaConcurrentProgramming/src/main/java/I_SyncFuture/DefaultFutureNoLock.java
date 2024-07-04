@@ -146,7 +146,7 @@ public class DefaultFutureNoLock implements Future<MsgResponse> {
 
     private void doReceived(MsgResponse msg) {
         msgResponse = msg;
-        LockSupport.unpark(msgIdThreads.get(msgId));
+        LockSupport.unpark(msgIdThreads.remove(msgId));
     }
 
 
