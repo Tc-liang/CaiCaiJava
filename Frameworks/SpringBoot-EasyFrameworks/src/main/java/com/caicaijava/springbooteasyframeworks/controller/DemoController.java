@@ -1,4 +1,4 @@
-package com.caicaijava.controller;
+package com.caicaijava.springbooteasyframeworks.controller;
 
 import com.caicaijava.common.CommonConfig;
 import org.springframework.beans.factory.annotation.Autowired;
