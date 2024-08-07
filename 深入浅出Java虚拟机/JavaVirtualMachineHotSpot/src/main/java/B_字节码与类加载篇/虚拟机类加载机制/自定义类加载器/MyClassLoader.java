@@ -3,7 +3,7 @@ package B_字节码与类加载篇.虚拟机类加载机制.自定义类加载�
 import java.io.*;
 
 /**
- * @author Tcl
+ * @author 菜菜的后端私房菜
  * @Date 2021/5/17
  * @Description: 自定义类加载器
  */

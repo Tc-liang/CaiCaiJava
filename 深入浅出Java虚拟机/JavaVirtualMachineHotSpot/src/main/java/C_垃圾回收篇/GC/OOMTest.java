@@ -1,7 +1,7 @@
 package C_垃圾回收篇.GC;
 
 /**
- * @author Tcl
+ * @author 菜菜的后端私房菜
  * @Date 2021/5/4
  * @Description:-Xms10m -Xmx10m -XX:+PrintGCDetails
  */

@@ -15,7 +15,7 @@ import java.util.concurrent.ArrayBlockingQueue;
  * <p>
  * 大吉大利            永无BUG
  *
- * @author Tcl
+ * @author 菜菜的后端私房菜
  * @Date 2022/2/26
  * @Description: 生产者消费者模型
  */

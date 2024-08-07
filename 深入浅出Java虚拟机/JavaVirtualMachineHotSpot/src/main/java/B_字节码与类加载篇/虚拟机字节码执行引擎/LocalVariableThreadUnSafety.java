@@ -3,7 +3,7 @@ package B_字节码与类加载篇.虚拟机字节码执行引擎;
 import java.util.concurrent.TimeUnit;
 
 /**
- * @author Tcl
+ * @author 菜菜的后端私房菜
  * @Date 2021/4/27
  * @Description:局部变量线程安全吗?
  */

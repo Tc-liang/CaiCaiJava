@@ -1,7 +1,7 @@
 package A_内存管理篇.A2_Java内存区域与内存溢出;
 
 /**
- * @author Tcl
+ * @author 菜菜的后端私房菜
  * @Date 2021/4/27
  * @Description:测试堆内存容量
  * -Xms1024m  修改初始化内存

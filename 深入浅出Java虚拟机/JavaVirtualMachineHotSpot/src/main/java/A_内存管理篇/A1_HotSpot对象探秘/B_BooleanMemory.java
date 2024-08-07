@@ -3,7 +3,7 @@ package A_内存管理篇.A1_HotSpot对象探秘;
 import org.openjdk.jol.info.ClassLayout;
 
 /**
- * @author Tcl
+ * @author 菜菜的后端私房菜
  * @Date 2021/5/13
  * @Description: 测试对象内存 boolean 与 内部类
  * boolean 虽然只需要一位判断真假，但JVM规范未规定要用多大空间，hotspot 64位使用1字节存储值，然后还有补3字节对齐

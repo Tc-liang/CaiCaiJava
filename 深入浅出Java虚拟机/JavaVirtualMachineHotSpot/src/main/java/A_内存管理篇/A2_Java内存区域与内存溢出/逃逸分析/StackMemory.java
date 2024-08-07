@@ -3,7 +3,7 @@ package A_内存管理篇.A2_Java内存区域与内存溢出.逃逸分析;
 import java.util.concurrent.TimeUnit;
 
 /**
- * @author Tcl
+ * @author 菜菜的后端私房菜
  * @Date 2021/4/28
  * @Description:
  * 逃逸分析带来的优化--测试栈上分配内存
