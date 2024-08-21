@@ -16,21 +16,22 @@ import java.util.Scanner;
  */
 public class ReflectionTest {
     public static void main(String[] args) {
-        Scanner scanner = new Scanner(System.in);
-        String numStr = "";
-
-        while (!numStr.equals("exit")) {
-            numStr = scanner.nextLine();
-            int count = Integer.parseInt(numStr);
-            long start = System.currentTimeMillis();
-            for (int i = 0; i < count; i++) {
-                jdkReflection();
-//                jdkConstructorReflection();
-//                springReflection();
-//                springConstructorReflection();
-            }
-            System.out.println(System.currentTimeMillis() - start);
-        }
+        jdkReflection();
+//        Scanner scanner = new Scanner(System.in);
+//        String numStr = "";
+//
+//        while (!numStr.equals("exit")) {
+//            numStr = scanner.nextLine();
+//            int count = Integer.parseInt(numStr);
+//            long start = System.currentTimeMillis();
+//            for (int i = 0; i < count; i++) {
+//                jdkReflection();
+////                jdkConstructorReflection();
+////                springReflection();
+////                springConstructorReflection();
+//            }
+//            System.out.println(System.currentTimeMillis() - start);
+//        }
     }
 
 

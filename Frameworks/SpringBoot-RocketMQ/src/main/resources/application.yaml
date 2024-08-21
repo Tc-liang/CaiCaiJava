@@ -1,0 +1,9 @@
+rocketmq:
+  name-server: 127.0.0.1:9876
+  producer:
+    send-message-timeout: 3000
+    retry-times-when-send-failed: 2
+    retry-times-when-send-async-failed: 2
+    retry-next-server: true
+  consumer:
+    pull-batch-size: 10
