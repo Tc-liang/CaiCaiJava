@@ -36,3 +36,7 @@ mvnw
 mvnw.cmd
 HELP.md
 .idea
+
+.mvn
+mvnw.cmd
+mvnw
