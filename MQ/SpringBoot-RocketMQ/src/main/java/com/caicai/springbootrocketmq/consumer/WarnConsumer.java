@@ -18,5 +18,4 @@ public class WarnConsumer implements RocketMQListener<String> {
         // 处理消息
         System.out.println("Received message: " + message);
     }
-
 }
