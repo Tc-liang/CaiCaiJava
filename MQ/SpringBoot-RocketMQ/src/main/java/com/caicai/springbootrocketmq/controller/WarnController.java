@@ -4,11 +4,21 @@ import com.caicai.springbootrocketmq.product.ServerProduct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.SendCallback;
 import org.apache.rocketmq.client.producer.SendResult;
-import org.apache.rocketmq.spring.core.RocketMQTemplate;
+import org.apache.rocketmq.client.producer.selector.SelectMessageQueueByHash;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Random;
+import java.util.UUID;
 
 
 @RequestMapping("/warn")
@@ -24,6 +34,11 @@ public class WarnController {
     @GetMapping("/syncSend")
     public SendResult syncSend() {
         return producer.sendSyncMsg(topic, "tag", "sync hello world!");
+    }
+
+    @GetMapping("/syncSendSelect/{id}")
+    public SendResult syncSendSelect(@PathVariable Long id) {
+        return producer.sendSyncMsgSelector(topic, "tag", "sync hello world!", new SelectMessageQueueByHash(), id.toString());
     }
 
     @GetMapping("/asyncSend")
@@ -43,9 +58,39 @@ public class WarnController {
         return "asyncSend ok";
     }
 
-    @GetMapping("/sendOnewayMsg")
-    public String onewaySend() {
-        producer.sendOnewayMsg(topic, "tag", "oneway hello world!");
+    @GetMapping("/sendOnewayMsg/{count}")
+    public String onewaySend(@PathVariable int count) {
+        byte[] payload = generateThreeMBString();
+        for (int i = 0; i < count; i++) {
+            producer.sendOnewayMsg(topic, "*", payload);
+        }
         return "sendOnewayMsg ok";
     }
+
+    @GetMapping("/sendKeyMsg/{count}")
+    public String sendKeyMsg(@PathVariable int count) throws IOException {
+        String key = "CAICAIJAVA";
+        for (int i = 0; i < count; i++) {
+            producer.sendOnewayMsg(topic, "*", key.getBytes(StandardCharsets.UTF_8));
+        }
+        return "sendOnewayMsg ok";
+    }
+
+    private static byte[] generateThreeMBString() {
+        // 3MB的字节数
+        int threeMB = 3 * 1024 * 1024;
+
+        // 生成3MB大小的字符串
+        Random random = new Random();
+        StringBuilder sb = new StringBuilder(threeMB);
+        for (int i = 0; i < threeMB; i++) {
+            char c = (char) ('A' + random.nextInt(26)); // 生成随机大写字母
+            sb.append(c);
+        }
+
+        // 将字符串转换为字节数组
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
 }
+
+

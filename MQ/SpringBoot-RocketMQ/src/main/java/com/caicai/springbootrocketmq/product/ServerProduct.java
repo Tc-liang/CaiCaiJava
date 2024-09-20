@@ -3,6 +3,7 @@ package com.caicai.springbootrocketmq.product;
 import org.apache.rocketmq.client.exception.MQBrokerException;
 import org.apache.rocketmq.client.exception.MQClientException;
 import org.apache.rocketmq.client.producer.DefaultMQProducer;
+import org.apache.rocketmq.client.producer.MessageQueueSelector;
 import org.apache.rocketmq.client.producer.SendCallback;
 import org.apache.rocketmq.client.producer.SendResult;
 import org.apache.rocketmq.common.message.Message;
@@ -51,6 +52,19 @@ public class ServerProduct {
         return sendResult;
     }
 
+    public SendResult sendSyncMsgSelector(String topic, String tag, String jsonBody, MessageQueueSelector selector, String key) {
+        Message message = new Message(topic, tag, jsonBody.getBytes(StandardCharsets.UTF_8));
+        message.setKeys(key);
+
+        SendResult sendResult;
+        try {
+            sendResult = producer.send(message, selector, key);
+        } catch (MQClientException | RemotingException | MQBrokerException | InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+        return sendResult;
+    }
+
     public void sendAsyncMsg(String topic, String tag, String jsonBody, SendCallback sendCallback) {
         Message message = new Message(topic, tag, jsonBody.getBytes(StandardCharsets.UTF_8));
         try {
@@ -60,8 +74,17 @@ public class ServerProduct {
         }
     }
 
-    public void sendOnewayMsg(String topic, String tag, String jsonBody) {
-        Message message = new Message(topic, tag, jsonBody.getBytes(StandardCharsets.UTF_8));
+    public void sendOnewayMsg(String topic, String tag, byte[] body) {
+        Message message = new Message(topic, tag, body);
+        try {
+            producer.sendOneway(message);
+        } catch (MQClientException | RemotingException | InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public void sendOnewayMsg(String topic, String tag, String key, byte[] body) {
+        Message message = new Message(topic, tag, key, body);
         try {
             producer.sendOneway(message);
         } catch (MQClientException | RemotingException | InterruptedException e) {
