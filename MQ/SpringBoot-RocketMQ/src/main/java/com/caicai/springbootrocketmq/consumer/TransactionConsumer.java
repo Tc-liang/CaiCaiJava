@@ -8,6 +8,6 @@ import org.springframework.stereotype.Component;
  * @description:
  */
 @Component
-@ConsumerListener(topic = "TopicTest", consumerGroupName = "warn_consumer_group")
-public class WarnTwoConsumer {
+@ConsumerListener(topic = "TransactionTopicTest", consumerGroupName = "transaction_consumer_group")
+public class TransactionConsumer {
 }

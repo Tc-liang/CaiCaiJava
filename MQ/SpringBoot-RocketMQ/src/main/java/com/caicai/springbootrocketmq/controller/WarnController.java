@@ -1,6 +1,7 @@
 package com.caicai.springbootrocketmq.controller;
 
 import com.caicai.springbootrocketmq.product.ServerProduct;
+import com.caicai.springbootrocketmq.product.ServerTransactionProduct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.SendCallback;
 import org.apache.rocketmq.client.producer.SendResult;
@@ -27,9 +28,13 @@ import java.util.UUID;
 public class WarnController {
 
     private static final String topic = "TopicTest";
+    private static final String transactionTopic = "TransactionTopicTest";
 
     @Autowired
     private ServerProduct producer;
+
+    @Autowired
+    private ServerTransactionProduct transactionProduct;
 
     @GetMapping("/syncSend")
     public SendResult syncSend() {
@@ -68,12 +73,35 @@ public class WarnController {
     }
 
     @GetMapping("/sendKeyMsg/{count}")
-    public String sendKeyMsg(@PathVariable int count) throws IOException {
+    public String sendKeyMsg(@PathVariable int count) {
         String key = "CAICAIJAVA";
         for (int i = 0; i < count; i++) {
             producer.sendOnewayMsg(topic, "*", key.getBytes(StandardCharsets.UTF_8));
         }
         return "sendOnewayMsg ok";
+    }
+
+
+    @GetMapping("/sendDelayMsg/{delayLevel}")
+    public String sendDelayMsg(@PathVariable("delayLevel") int delayLevel) {
+        String msg = "DelayMsg";
+        producer.sendDelayMsg(topic, "*", msg.getBytes(StandardCharsets.UTF_8), delayLevel);
+        log.info("发送延时消息成功");
+        return "sendDelayMsg ok";
+    }
+
+    @GetMapping("/sendOrderMsg")
+    public String sendOrderMsg() {
+        String msg = "sendOrderMsg1";
+        producer.sendOrderMsg(topic, msg, new SelectMessageQueueByHash(), "1");
+        return "sendOrderMsg ok";
+    }
+
+    @GetMapping("/sendTransactionMsg/{orderId}")
+    public String sendTransactionMsg(@PathVariable("orderId") Integer orderId) {
+        String msg = "sendTransactionMsg " + orderId;
+        transactionProduct.sendTransactionMsg(transactionTopic, msg, orderId.toString());
+        return "send " + msg + "ok";
     }
 
     private static byte[] generateThreeMBString() {

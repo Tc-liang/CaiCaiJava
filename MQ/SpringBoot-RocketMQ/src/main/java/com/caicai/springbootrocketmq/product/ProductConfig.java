@@ -1,5 +1,7 @@
 package com.caicai.springbootrocketmq.product;
 
+import com.caicai.springbootrocketmq.product.transaction.TransactionListenerImpl;
+import org.apache.rocketmq.client.producer.TransactionListener;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -12,7 +14,17 @@ import org.springframework.context.annotation.Configuration;
 public class ProductConfig {
 
     @Bean
-    public ServerProduct producer() {
+    public ServerProduct serverProduct() {
         return new ServerProduct();
+    }
+
+    @Bean
+    public ServerTransactionProduct serverTransactionProduct() {
+        return new ServerTransactionProduct(transactionListener());
+    }
+
+    @Bean
+    public TransactionListener transactionListener() {
+        return new TransactionListenerImpl();
     }
 }

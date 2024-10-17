@@ -2,14 +2,16 @@ package com.caicai.springbootrocketmq.product;
 
 import org.apache.rocketmq.client.exception.MQBrokerException;
 import org.apache.rocketmq.client.exception.MQClientException;
-import org.apache.rocketmq.client.producer.DefaultMQProducer;
-import org.apache.rocketmq.client.producer.MessageQueueSelector;
-import org.apache.rocketmq.client.producer.SendCallback;
-import org.apache.rocketmq.client.producer.SendResult;
+import org.apache.rocketmq.client.producer.*;
+import org.apache.rocketmq.client.producer.selector.SelectMessageQueueByHash;
 import org.apache.rocketmq.common.message.Message;
+import org.apache.rocketmq.common.message.MessageQueue;
 import org.apache.rocketmq.remoting.exception.RemotingException;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * @author: 菜菜的后端私房菜
@@ -19,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 public class ServerProduct {
 
     private DefaultMQProducer producer;
+
 
     public ServerProduct(String producerGroup) {
         producer = new DefaultMQProducer(producerGroup);
@@ -93,4 +96,35 @@ public class ServerProduct {
     }
 
 
+    public void sendDelayMsg(String topic, String tag, byte[] body, int delayLevel) {
+        Message message = new Message(topic, tag, body);
+        message.setDelayTimeLevel(delayLevel);
+        try {
+            producer.send(message);
+        } catch (MQClientException | RemotingException | InterruptedException | MQBrokerException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
+    public void sendOrderMsg(String topic, String msg, SelectMessageQueueByHash selectMessageQueue, String orderId) {
+        Message message = new Message(topic, msg.getBytes());
+        message.setBuyerId(orderId);
+        try {
+            producer.send(message, selectMessageQueue, orderId);
+        } catch (MQClientException | RemotingException | InterruptedException | MQBrokerException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public void sendOrderMsg(String topic, String... msg) {
+        List<Message> msgs = Arrays
+                .stream(msg)
+                .map(m -> new Message(topic, m.getBytes())).collect(Collectors.toList());
+        try {
+            producer.send(msgs);
+        } catch (MQClientException | RemotingException | InterruptedException | MQBrokerException e) {
+            throw new RuntimeException(e);
+        }
+    }
 }
