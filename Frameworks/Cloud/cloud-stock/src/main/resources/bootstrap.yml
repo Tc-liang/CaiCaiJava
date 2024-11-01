@@ -1,0 +1,19 @@
+spring:
+  cloud:
+    nacos:
+      #注册中心
+      discovery:
+        server-addr: 127.0.0.1:8848
+      #配置中心
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yml
+  application:
+    #服务名
+    name: cloud-stock
+  profiles:
+    #环境
+    active: dev
+server:
+  #端口
+  port: 8002
