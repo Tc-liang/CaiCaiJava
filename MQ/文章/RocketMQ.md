@@ -2671,4 +2671,1631 @@ if (BrokerRole.SLAVE != DefaultMessageStore.this.getMessageStoreConfig().getBrok
 
 关注菜菜，分享更多技术干货，公众号：菜菜的后端私房菜
 
+
+
+
+
+
+
+
+
+## RocketMQ（五）：揭秘高吞吐量并发消费原理
+
+上篇文章已经描述过拉取消息的流程，消息被拉取到消费者内存后就会提交消费消息请求从而开始消费消息
+
+消费消息分为两种方式：**并发消费、顺序消费**
+
+1.  **并发消费采用多线程进行消费，能够大大提升消费吞吐量，但无法保证消费顺序**
+2.  **顺序消费会通过加锁的方式进行有序消费，但吞吐量、性能不如并发**
+
+本篇文章就来聊聊并发消费，揭秘RocketMQ高吞吐量并发消费的原理
+
+
+思维导图如下：
+
+
+![](https://bbs-img.huaweicloud.com/blogs/img/20241023/1729650541817873299.png)
+
+>往期好文：
+
+
+[RocketMQ（一）：消息中间件缘起，一览整体架构及核心组件](https://juejin.cn/post/7411686792342732841)
+
+[RocketMQ（二）：揭秘发送消息核心原理（源码与设计思想解析）](https://juejin.cn/post/7412672656363798591)
+
+[RocketMQ（三）：面对高并发请求，如何高效持久化消息？（核心存储文件、持久化核心原理、源码解析）](https://juejin.cn/post/7412922870521184256)
+
+[RocketMQ（四）：消费前如何拉取消息？（长轮询机制）](https://juejin.cn/post/7417635848987033615)
+
+
+
+### 消费者消费流程
+
+#### ConsumeMessageConcurrentlyService 消费消息
+
+上篇文章说到，拉取完消息后会提交消费请求，便于后续进行异步消费
+
+```java
+DefaultMQPushConsumerImpl.this.consumeMessageService.submitConsumeRequest
+```
+
+`submitConsumeRequest` 方法有并发、顺序两种实现，先来查看并发实现
+
+> ConsumeMessageConcurrentlyService.submitConsumeRequest
+
+**并发的实现主要会根据每次批量消费的最大数量进行构建请求并提交，如果期间失败会延时5s再提交**
+
+```java
+public void submitConsumeRequest(
+    final List<MessageExt> msgs,
+    final ProcessQueue processQueue,
+    final MessageQueue messageQueue,
+    final boolean dispatchToConsume) {
+    //每次批量消费最大数量 默认为1 （消息充足的情况下，默认每次拉取32条消息）
+    final int consumeBatchSize = this.defaultMQPushConsumer.getConsumeMessageBatchMaxSize();
+    //如果拉取到的消息小于等于每次批量消费数量 则构建请求并提交
+    if (msgs.size() <= consumeBatchSize) {
+        ConsumeRequest consumeRequest = new ConsumeRequest(msgs, processQueue, messageQueue);
+        try {
+            this.consumeExecutor.submit(consumeRequest);
+        } catch (RejectedExecutionException e) {
+            //失败 延迟5s再提交请求
+            this.submitConsumeRequestLater(consumeRequest);
+        }
+    } else {
+        //如果拉取到的消息 大于 每次批量消费数量，则分批次构建请求并提交
+        for (int total = 0; total < msgs.size(); ) {
+            List<MessageExt> msgThis = new ArrayList<MessageExt>(consumeBatchSize);
+            for (int i = 0; i < consumeBatchSize; i++, total++) {
+                if (total < msgs.size()) {
+                    msgThis.add(msgs.get(total));
+                } else {
+                    break;
+                }
+            }
+
+            ConsumeRequest consumeRequest = new ConsumeRequest(msgThis, processQueue, messageQueue);
+            try {
+                this.consumeExecutor.submit(consumeRequest);
+            } catch (RejectedExecutionException e) {
+                for (; total < msgs.size(); total++) {
+                    msgThis.add(msgs.get(total));
+                }
+
+                this.submitConsumeRequestLater(consumeRequest);
+            }
+        }
+    }
+}
+```
+
+并发、顺序实现中，构建的请求`ConsumeRequest` 并不是共享的，而是它们的内部类，虽然同名但是实现是不同的
+
+提交后使用消费线程池执行，在执行任务的过程中，主要会**调用消费监听器进行消费消息 `consumeMessage`，然后通过成功/失败的情况进行处理结果`processConsumeResult`**
+
+（在此期间还会封装上下文，执行消费前、后的钩子方法，记录消费耗时等操作）
+
+```java
+public void run() {
+    //检查processQueue
+    if (this.processQueue.isDropped()) {
+        log.info("the message queue not be able to consume, because it's dropped. group={} {}", ConsumeMessageConcurrentlyService.this.consumerGroup, this.messageQueue);
+        return;
+    }
+
+    //获取并发消息监听器 (我们设置消费者时实现的)
+    MessageListenerConcurrently listener = ConsumeMessageConcurrentlyService.this.messageListener;
+    //上下文 用于执行消费过程中的钩子方法
+    ConsumeConcurrentlyContext context = new ConsumeConcurrentlyContext(messageQueue);
+    //状态
+    ConsumeConcurrentlyStatus status = null;
+    //失败重试的情况下会更新topic
+    defaultMQPushConsumerImpl.resetRetryAndNamespace(msgs, defaultMQPushConsumer.getConsumerGroup());
+
+    //保留上下文信息 执行消费前的钩子方法时使用
+    ConsumeMessageContext consumeMessageContext = null;
+    if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
+        consumeMessageContext = new ConsumeMessageContext();
+        consumeMessageContext.setNamespace(defaultMQPushConsumer.getNamespace());
+        consumeMessageContext.setConsumerGroup(defaultMQPushConsumer.getConsumerGroup());
+        consumeMessageContext.setProps(new HashMap<String, String>());
+        consumeMessageContext.setMq(messageQueue);
+        consumeMessageContext.setMsgList(msgs);
+        consumeMessageContext.setSuccess(false);
+        ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.executeHookBefore(consumeMessageContext);
+    }
+
+    //计时
+    long beginTimestamp = System.currentTimeMillis();
+    //记录是否异常
+    boolean hasException = false;
+    ConsumeReturnType returnType = ConsumeReturnType.SUCCESS;
+    try {
+        //每个消息记录开始时间
+        if (msgs != null && !msgs.isEmpty()) {
+            for (MessageExt msg : msgs) {
+                MessageAccessor.setConsumeStartTimeStamp(msg, String.valueOf(System.currentTimeMillis()));
+            }
+        }
+        //消费消息
+        status = listener.consumeMessage(Collections.unmodifiableList(msgs), context);
+    } catch (Throwable e) {
+        hasException = true;
+    }
+    //消费耗时
+    long consumeRT = System.currentTimeMillis() - beginTimestamp;
+    
+    //计算返回类型
+    if (null == status) {
+        if (hasException) {
+            returnType = ConsumeReturnType.EXCEPTION;
+        } else {
+            returnType = ConsumeReturnType.RETURNNULL;
+        }
+    } else if (consumeRT >= defaultMQPushConsumer.getConsumeTimeout() * 60 * 1000) {
+        returnType = ConsumeReturnType.TIME_OUT;
+    } else if (ConsumeConcurrentlyStatus.RECONSUME_LATER == status) {
+        returnType = ConsumeReturnType.FAILED;
+    } else if (ConsumeConcurrentlyStatus.CONSUME_SUCCESS == status) {
+        returnType = ConsumeReturnType.SUCCESS;
+    }
+
+    if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
+        consumeMessageContext.getProps().put(MixAll.CONSUME_CONTEXT_TYPE, returnType.name());
+    }
+
+    if (null == status) {
+        status = ConsumeConcurrentlyStatus.RECONSUME_LATER;
+    }
+
+    //消费后的钩子
+    if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
+        consumeMessageContext.setStatus(status.toString());
+        consumeMessageContext.setSuccess(ConsumeConcurrentlyStatus.CONSUME_SUCCESS == status);
+        ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.executeHookAfter(consumeMessageContext);
+    }
+
+    //增加消费时间 用于运营统计
+    ConsumeMessageConcurrentlyService.this.getConsumerStatsManager()
+        .incConsumeRT(ConsumeMessageConcurrentlyService.this.consumerGroup, messageQueue.getTopic(), consumeRT);
+
+    if (!processQueue.isDropped()) {
+        //处理消费结果
+        ConsumeMessageConcurrentlyService.this.processConsumeResult(status, context, this);
+    } else {
+        log.warn("processQueue is dropped without process consume result. messageQueue={}, msgs={}", messageQueue, msgs);
+    }
+}
+```
+
+`processConsumeResult` 根据状态处理消费结果，分为两个状态：CONSUME_SUCCESS（成功）或RECONSUME_LATER（失败重试）和两种模式：广播、集群模式
+
+无论成功还是失败都会统计对应的数据
+
+**如果集群模式下失败，会调用 `sendMessageBack` 向Broker发送消息，将消息放入重试队列中，到期后进行重试；如果发送失败则延时5S重新进行消费**
+
+**最终会移除ProcessorQueue中的消息并获取偏移量进行更新**
+
+```java
+public void processConsumeResult(
+    final ConsumeConcurrentlyStatus status,
+    final ConsumeConcurrentlyContext context,
+    final ConsumeRequest consumeRequest
+) {
+    //默认int最大
+    int ackIndex = context.getAckIndex();
+
+    if (consumeRequest.getMsgs().isEmpty())
+        return;
+
+    switch (status) {
+        case CONSUME_SUCCESS:
+            //成功的情况下 ackIndex为本次消费数量-1
+            if (ackIndex >= consumeRequest.getMsgs().size()) {
+                ackIndex = consumeRequest.getMsgs().size() - 1;
+            }
+            int ok = ackIndex + 1;
+            int failed = consumeRequest.getMsgs().size() - ok;
+            //统计数据
+            this.getConsumerStatsManager().incConsumeOKTPS(consumerGroup, consumeRequest.getMessageQueue().getTopic(), ok);
+            this.getConsumerStatsManager().incConsumeFailedTPS(consumerGroup, consumeRequest.getMessageQueue().getTopic(), failed);
+            break;
+        case RECONSUME_LATER:
+            //失败的情况下ackIndex为-1
+            ackIndex = -1;
+            //统计数据
+            this.getConsumerStatsManager().incConsumeFailedTPS(consumerGroup, consumeRequest.getMessageQueue().getTopic(),
+                consumeRequest.getMsgs().size());
+            break;
+        default:
+            break;
+    }
+
+    switch (this.defaultMQPushConsumer.getMessageModel()) {
+        case BROADCASTING:
+            //如果能进入循环说明本次消费失败 广播模式 只打印日志 后续会调用本地的修改偏移量 相当于舍弃/删除 不处理
+            for (int i = ackIndex + 1; i < consumeRequest.getMsgs().size(); i++) {
+                MessageExt msg = consumeRequest.getMsgs().get(i);
+                log.warn("BROADCASTING, the message consume failed, drop it, {}", msg.toString());
+            }
+            break;
+        case CLUSTERING:
+            List<MessageExt> msgBackFailed = new ArrayList<MessageExt>(consumeRequest.getMsgs().size());
+            //如果能进入循环说明本次消费失败
+            for (int i = ackIndex + 1; i < consumeRequest.getMsgs().size(); i++) {
+                MessageExt msg = consumeRequest.getMsgs().get(i);
+                //向broker发送消息 重试消息要放入对应的重试队列中
+                boolean result = this.sendMessageBack(msg, context);
+                if (!result) {
+                    //发送失败记录
+                    msg.setReconsumeTimes(msg.getReconsumeTimes() + 1);
+                    msgBackFailed.add(msg);
+                }
+            }
+            
+			//发送失败延时消费
+            if (!msgBackFailed.isEmpty()) {
+                consumeRequest.getMsgs().removeAll(msgBackFailed);
+                this.submitConsumeRequestLater(msgBackFailed, consumeRequest.getProcessQueue(), consumeRequest.getMessageQueue());
+            }
+            break;
+        default:
+            break;
+    }
+
+    //删除本次消费消息，获取偏移量
+    long offset = consumeRequest.getProcessQueue().removeMessage(consumeRequest.getMsgs());
+    if (offset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {
+        //更新偏移量
+        this.defaultMQPushConsumerImpl.getOffsetStore().updateOffset(consumeRequest.getMessageQueue(), offset, true);
+    }
+}
+```
+
+**广播模式使用 `LocalFileOffsetStore` 更新偏移量，集群模式使用 `RemoteBrokerOffsetStore` 更新偏移量**
+
+它们都是在内存更新偏移量，但**`RemoteBrokerOffsetStore`会定期向Broker进行更新消费偏移量**
+
+```java
+public void updateOffset(MessageQueue mq, long offset, boolean increaseOnly) {
+    if (mq != null) {
+        //mq旧偏移量
+        AtomicLong offsetOld = this.offsetTable.get(mq);
+        if (null == offsetOld) {
+            offsetOld = this.offsetTable.putIfAbsent(mq, new AtomicLong(offset));
+        }
+
+        if (null != offsetOld) {
+            //递增 CAS替换
+            if (increaseOnly) {
+                MixAll.compareAndIncreaseOnly(offsetOld, offset);
+            } else {
+                offsetOld.set(offset);
+            }
+        }
+    }
+}
+```
+
+顺序模式消费消息流程类似但加锁较为复杂，后文再详细说明
+
+总结一下并发消费流程：
+
+1. **拉取到消息后，回调中还会提交消费请求submitConsumerRequest**
+2. **根据最大消费消息数量，将本次拉取的消息进行分批次构建请求ConsumerRequest并提交到线程池执行**
+3. **执行ConsumerRequest任务主要调用消息监听器进行消费消息**（这里的逻辑是我们实现如何消费消息的，并返回状态），**并通过返回的状态处理消费结果**
+4. **集群模式下消费失败会向Broker发送重试请求，如果发送失败会延时再次提交消费请求进行重新消费**
+5. **如果消费成功，从ProcessorQueue中移除消息并更新内存中Broker的消费偏移量**（此时还没有向Broker提交更新消费偏移量的请求）
+
+![](https://bbs-img.huaweicloud.com/blogs/img/20240910/1725960469899709352.png)
+
+
+
+#### 定时更新消费偏移量
+
+并发消费消息只是修改内存中Broker的消费偏移量
+
+真正更新消费偏移量的是**MQClientInstance启动时的定时任务每10s调用`persistAllConsumerOffset`向Broker更新当前节点所有消费者的消费偏移量**
+
+```java
+this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+
+    @Override
+    public void run() {
+        try {
+            MQClientInstance.this.persistAllConsumerOffset();
+        } catch (Exception e) {
+            log.error("ScheduledTask persistAllConsumerOffset exception", e);
+        }
+    }
+}, 1000 * 10, this.clientConfig.getPersistConsumerOffsetInterval(), TimeUnit.MILLISECONDS);
+```
+
+`persistAllConsumerOffset`会遍历消费者进行持久化消费偏移量
+
+```java
+private void persistAllConsumerOffset() {
+    //遍历消费者
+    Iterator<Entry<String, MQConsumerInner>> it = this.consumerTable.entrySet().iterator();
+    while (it.hasNext()) {
+        Entry<String, MQConsumerInner> entry = it.next();
+        MQConsumerInner impl = entry.getValue();
+        //持久化消费偏移量
+        impl.persistConsumerOffset();
+    }
+}
+```
+
+
+
+> DefaultMQPushConsumerImpl.persistConsumerOffset
+
+**`persistConsumerOffset`会根据再平衡组件`RebalanceImpl`获取当前消费者负责消费的队列，再调用`this.offsetStore.persistAll`进行后续持久化**
+
+（再平衡组件通过负载算法决定消费者负责消费哪些队列，后续文章再讲解再平衡机制）
+
+```java
+public void persistConsumerOffset() {
+    try {
+        this.makeSureStateOK();
+        Set<MessageQueue> mqs = new HashSet<MessageQueue>();
+        //获取负责消费的队列
+        Set<MessageQueue> allocateMq = this.rebalanceImpl.getProcessQueueTable().keySet();
+        //不破坏原容器
+        mqs.addAll(allocateMq);
+        this.offsetStore.persistAll(mqs);
+    } catch (Exception e) {
+        log.error("group: " + this.defaultMQPushConsumer.getConsumerGroup() + " persistConsumerOffset exception", e);
+    }
+}
+```
+
+
+
+> RemoteBrokerOffsetStore.persistAll
+
+**遍历每个队列调用`updateConsumeOffsetToBroker`向Broker更新消费偏移量，如果有队列未使用则从offsetTable中移除**
+
+```java
+public void persistAll(Set<MessageQueue> mqs) {
+    if (null == mqs || mqs.isEmpty())
+        return;
+
+    final HashSet<MessageQueue> unusedMQ = new HashSet<MessageQueue>();
+	
+    //遍历消费偏移量表 Key为队列 Value为偏移量
+    for (Map.Entry<MessageQueue, AtomicLong> entry : this.offsetTable.entrySet()) {
+        MessageQueue mq = entry.getKey();
+        AtomicLong offset = entry.getValue();
+        if (offset != null) {
+            if (mqs.contains(mq)) {
+                try {
+                    //向Broker进行更新消费偏移量
+                    this.updateConsumeOffsetToBroker(mq, offset.get());
+                    log.info("[persistAll] Group: {} ClientId: {} updateConsumeOffsetToBroker {} {}",
+                        this.groupName,
+                        this.mQClientFactory.getClientId(),
+                        mq,
+                        offset.get());
+                } catch (Exception e) {
+                    log.error("updateConsumeOffsetToBroker exception, " + mq.toString(), e);
+                }
+            } else {
+                //记录未使用的队列
+                unusedMQ.add(mq);
+            }
+        }
+    }
+
+    //未使用的队列进行移除
+    if (!unusedMQ.isEmpty()) {
+        for (MessageQueue mq : unusedMQ) {
+            this.offsetTable.remove(mq);
+            log.info("remove unused mq, {}, {}", mq, this.groupName);
+        }
+    }
+}
+```
+
+
+
+> RemoteBrokerOffsetStore.updateConsumeOffsetToBroker
+
+定时任务调用的，第三个参数isOneway默认为true，这就说明是异步发送请求，无需关心是否发送/响应成功
+
+**在更新Broker前还需要获取Broker信息（本地内存未获取到就从NameServer获取，再存入本地内存）、封装请求，再通过RPC请求Broker**
+
+```java
+public void updateConsumeOffsetToBroker(MessageQueue mq, long offset, boolean isOneway) throws RemotingException,
+    MQBrokerException, InterruptedException, MQClientException {
+    //获取Broker信息    
+    FindBrokerResult findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(), MixAll.MASTER_ID, true);
+    if (null == findBrokerResult) {
+        this.mQClientFactory.updateTopicRouteInfoFromNameServer(mq.getTopic());
+        findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(), MixAll.MASTER_ID, false);
+    }
+
+    if (findBrokerResult != null) {
+        //封装请求
+        UpdateConsumerOffsetRequestHeader requestHeader = new UpdateConsumerOffsetRequestHeader();
+        requestHeader.setTopic(mq.getTopic());
+        requestHeader.setConsumerGroup(this.groupName);
+        requestHeader.setQueueId(mq.getQueueId());
+        requestHeader.setCommitOffset(offset);
+
+        if (isOneway) {
+            //异步
+            this.mQClientFactory.getMQClientAPIImpl().updateConsumerOffsetOneway(
+                findBrokerResult.getBrokerAddr(), requestHeader, 1000 * 5);
+        } else {
+            //同步阻塞
+            this.mQClientFactory.getMQClientAPIImpl().updateConsumerOffset(
+                findBrokerResult.getBrokerAddr(), requestHeader, 1000 * 5);
+        }
+    } else {
+        throw new MQClientException("The broker[" + mq.getBrokerName() + "] not exist", null);
+    }
+}
+```
+
+总的来说，**定时更新就是遍历消费者的每个队列，向Broker提交异步更新每个队列消费偏移量的请求**
+
+![定时向Broker更新消费偏移量](https://bbs-img.huaweicloud.com/blogs/img/20240910/1725961604864900807.png)
+
+梳理完消费者消费消息的流程，再来看下Broker在该流程中需要处理的两个请求：消费失败的请求和消费成功更新消费偏移量的请求
+
+
+
+
+
+### Broker处理流程
+
+#### Broker处理更新消费偏移量请求
+
+更新消费偏移量的请求码为`UPDATE_CONSUMER_OFFSET`，上篇文章在讲拉取消息时向Broker读取消费偏移量的请求码为`QUERY_CONSUMER_OFFSET`
+
+处理读写消费偏移量请求的都是相同组件`ConsumerManageProcessor`
+
+**读写消费偏移量实际上都是对Broker内存管理偏移量的`ConsumerOffsetManager`进行读写它的双层Map`offsetTable`，其中Key为`Topic@消费者组`Value则为队列ID与消费偏移量的映射**
+
+```java
+private void commitOffset(final String clientHost, final String key, final int queueId, final long offset) {
+    //根据Key获取 队列和消费偏移量映射
+    ConcurrentMap<Integer, Long> map = this.offsetTable.get(key);
+    if (null == map) {
+        //没有就初始化更新完放入
+        map = new ConcurrentHashMap<Integer, Long>(32);
+        map.put(queueId, offset);
+        this.offsetTable.put(key, map);
+    } else {
+        //内存更新
+        Long storeOffset = map.put(queueId, offset);
+        if (storeOffset != null && offset < storeOffset) {
+            log.warn("[NOTIFYME]update consumer offset less than store. clientHost={}, key={}, queueId={}, requestOffset={}, storeOffset={}", clientHost, key, queueId, offset, storeOffset);
+        }
+    }
+}
+```
+
+Broker端的更新消费偏移量也是内存级别的操作，真正持久化也是定时刷盘的任务进行的（初始化延迟10S，后续5S定时刷盘）
+
+```java
+this.scheduledExecutorService.scheduleAtFixedRate(() -> {
+    try {
+        BrokerController.this.consumerOffsetManager.persist();
+    } catch (Throwable e) {
+        log.error("schedule persist consumerOffset error.", e);
+    }
+}, 1000 * 10, this.brokerConfig.getFlushConsumerOffsetInterval(), TimeUnit.MILLISECONDS);
+```
+
+异步刷盘的文件为`consumerOffset.json`，内容为JSON格式的双层Map`offsetTable`，第一层为topic@消费者组名，第二层Key为队列ID，VALUE为消费偏移量（如下JSON文件所示）
+
+```java
+{
+	"offsetTable":{
+		"%RETRY%warn_consumer_group@warn_consumer_group":{0:2
+		},
+		"%RETRY%order_consumer_group@order_consumer_group":{0:0
+		},
+		"TopicTest@please_rename_unique_group_name_5":{0:273,1:269,2:270,3:271,4:270,5:270,6:273,7:272
+		},
+		"TopicTest@order_consumer_group":{0:727914,1:727908,2:727913,3:727916,4:727910,5:727911,6:727918,7:727966
+		},
+		"TopicTest@warn_consumer_group":{0:727914,1:727908,2:727913,3:727916,4:727910,5:727911,6:727918,7:727966
+		}
+	}
+}
+```
+
+**Broker使用ConsumerManagerProcessor负责处理消费相关请求，并使用管理消费偏移量的ConsumerOffsetManager根据topic、消费者组、队列id、消费偏移量等信息，对offsetTable进行更新消费偏移量，后续定时将offsetTable持久化为consumerOffset的JSON文件**
+
+![Broker处理更新消费偏移量](https://bbs-img.huaweicloud.com/blogs/img/20240911/1726025404625349683.png)
+
+
+
+#### Broker处理消费失败的请求
+
+集群模式下，消费失败会向Broker发送请求码为`CONSUMER_SEND_MSG_BACK`的消息
+
+处理该消息的Processor与处理生产者发送消息的相同，都是SendMessageProcessor
+
+它会调用`asyncConsumerSendMsgBack`处理消费失败的请求
+
+**处理时判断消息Topic是重试还是死信，然后再调用持久化消息`asyncPutMessage`的流程**
+
+（最终投入消息的流程也是调用之前持久化消息说过的`asyncPutMessage`，只是投入前判断是放入哪个队列中）
+
+不理解重试、死信等概念的同学可能不太懂这段源码，我们先来介绍下：
+
+消息消费失败后会放入重试队列进行重试，其中无序消息重试消费的时间间隔会递增
+
+当重试达到一定次数后认为“永远”无法消费，会将消息放入死信队列，放入死信队列可以让开发人员便于排查多次无法消费的原因
+
+```java
+private CompletableFuture<RemotingCommand> asyncConsumerSendMsgBack(ChannelHandlerContext ctx,
+                                                                    RemotingCommand request) throws RemotingCommandException {
+    //...
+
+    
+    //重试队列topic = %RETRY%+消费者组名
+    String newTopic = MixAll.getRetryTopic(requestHeader.getGroup());
+    int queueIdInt = ThreadLocalRandom.current().nextInt(99999999) % subscriptionGroupConfig.getRetryQueueNums();
+    int topicSysFlag = 0;
+    //...
+    
+    
+    //根据便宜量查出原来存储的消息
+    MessageExt msgExt = this.brokerController.getMessageStore().lookMessageByOffset(requestHeader.getOffset());
+    
+    //...
+    
+	//如果重试次数超过最大重试次数 默认16次  或 延迟等级为负数 则要放入死信队列
+    if (msgExt.getReconsumeTimes() >= maxReconsumeTimes
+        || delayLevel < 0) {
+        //死信队列topic =  %DLQ% + 消费者组名
+        newTopic = MixAll.getDLQTopic(requestHeader.getGroup());
+        queueIdInt = ThreadLocalRandom.current().nextInt(99999999) % DLQ_NUMS_PER_GROUP;
+        topicConfig = this.brokerController.getTopicConfigManager().createTopicInSendMessageBackMethod(newTopic,
+                DLQ_NUMS_PER_GROUP,
+                PermName.PERM_WRITE | PermName.PERM_READ, 0);
+        //如果要放入死信 会设置延时等级为0
+        msgExt.setDelayTimeLevel(0);
+    } else {
+        //重试的情况下 延时等级 = 3 + 消息重试次数
+        if (0 == delayLevel) {
+            delayLevel = 3 + msgExt.getReconsumeTimes();
+        }
+        //设置延时等级
+        msgExt.setDelayTimeLevel(delayLevel);
+    }
+
+    //封装消息 异步存储
+    MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
+    msgInner.setTopic(newTopic);
+    msgInner.setBody(msgExt.getBody());
+    msgInner.setFlag(msgExt.getFlag());
+    //...
+
+    CompletableFuture<PutMessageResult> putMessageResult = this.brokerController.getMessageStore().asyncPutMessage(msgInner);
+    return putMessageResult.thenApply(r -> {
+        //...
+    });
+}
+```
+
+重试Topic用`%RETRY%`与消费者组名进行拼接，用于消息的重试，并且只有一个队列用于存储需要重试的消息，那么它是如何做到不同时间间隔的消息到期后就进行重试的呢？
+
+其实该流程中**不仅会用到重试队列、死信队列，还会用到延时队列**
+
+当确认使用重试而不是死信队列时，会设置延时等级`msgExt.setDelayTimeLevel(delayLevel)`，使用死信时延时等级设置为0 `msgExt.setDelayTimeLevel(0)`
+
+这个延时等级后续持久化消息前会进行判断，如果设置的延时等级大于0，说明需要使用延时队列
+
+**每个级别的队列对应的延时时间不同，以此来实现等待一定的时间，还会将重试topic和队列id存入消息properties，延时到期后会将消息存入重试队列中，重试队列再被拉取消息进行重复消息**
+
+```java
+//消息设置过延时等级
+if (msg.getDelayTimeLevel() > 0) {
+    if (msg.getDelayTimeLevel() > this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel()) {
+        msg.setDelayTimeLevel(this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel());
+    }
+
+    //topic换成延时topic
+    topic = TopicValidator.RMQ_SYS_SCHEDULE_TOPIC;
+    //根据延时等级获取对应的延时队列 第一次延时等级设置的是3，这个方法会减1，也就是第一次会被放入延时队列id为2
+    int queueId = ScheduleMessageService.delayLevel2QueueId(msg.getDelayTimeLevel());
+
+    // Backup real topic, queueId
+    //将重试的topic、队列ID存入消息的properties，后续从延时队列出来重新存储时要使用
+    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_REAL_TOPIC, msg.getTopic());
+    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_REAL_QUEUE_ID, String.valueOf(msg.getQueueId()));
+    msg.setPropertiesString(MessageDecoder.messageProperties2String(msg.getProperties()));
+
+    //设置成延时topic和队列
+    msg.setTopic(topic);
+    msg.setQueueId(queueId);
+}
+```
+
+第一次重试设置的延时等级为3，调用`delayLevel2QueueId`会将延时等级减1，也就是第一次进入延时的队列ID为2
+
+延时队列ID范围为2-17，分别对应16个延时级别：
+
+| 第几次重试 | 与上次重试的间隔时间 | 第几次重试 | 与上次重试的间隔时间 |
+| ---------- | -------------------- | ---------- | -------------------- |
+| 1          | 10秒                 | 9          | 7分钟                |
+| 2          | 30秒                 | 10         | 8分钟                |
+| 3          | 1分钟                | 11         | 9分钟                |
+| 4          | 2分钟                | 12         | 10分钟               |
+| 5          | 3分钟                | 13         | 20分钟               |
+| 6          | 4分钟                | 14         | 30分钟               |
+| 7          | 5分钟                | 15         | 1小时                |
+| 8          | 6分钟                | 16         | 2小时                |
+
+延时队列的原理与实现细节也很多，放在后文再进行解析
+
+**Broker处理消费重试请求，实际上就是判断是否超过最大重试次数，如果超过放入死信队列、未超过放入重试队列并设置延时级别**
+
+**而在CommitLog追加数据前，会判断是否设置延时级别，如果设置过要更改消息topic、queueid等信息，将其投入延时队列中**（这里只是写CommitLog，写延时队列的ConsumerQueue是异步重投的，前文已经说过）
+
+**等到延时后消息从延时队列出来被投入重试队列中，后续继续被拉取消费**（延时队列的实现原理后文描述）
+
+（图片原稿弄丢了，根据之前的图片贴上来补画的流程图，将就看~）
+
+![Broker处理消费重试](https://bbs-img.huaweicloud.com/blogs/img/20240911/1726036230455720433.png)
+
+你可能会有疑问，拉取消息需要通过PullRequest，而每个PullRequest对应一个队列，那么是谁把重试队列对应的PullRequest加入拉取消息的流程呢？
+
+这也是再平衡机制进行处理的，后续的文章再来分析再平衡机制是如何为每个消费者分配队列的
+
+
+
+
+
+### 总结
+
+**提交消费请求后，会根据每次消费批处理最大消息数量进行分批次构建消费请求并提交到线程池执行任务**
+
+**并发消费消息的特点是吞吐量大，使用线程池对拉取的消息进行消费，但是消费消息是无法预估执行顺序**
+
+**消费消息时会使用消费者的消费监听器进行消费消息并获取返回状态，根据状态进行后续的处理（集群模式下）**
+
+**如果状态为成功则删除ProcessQueue中的消息，并更新内存中记录Broker的消费偏移量，后续定时任务向Broker进行更新该消费者所有队列对应的消费偏移量**
+
+**Broker更新队列的消费偏移量时，实际上也是在内存更新ConsumerOffsetManager的offsettable记录的消费偏移量，后续定时将其持久化到consumerOffset.json文件**
+
+**如果状态为失败，则会向Broker发送消费重试的同步请求，如果请求超时或未发出去，则再次延时提交该消费请求，后续重新消费**
+
+**Broker收到消费重试请求后，相当于又要进行持久化，只是期间会改变消息topic、队列等信息，根据重试次数判断是否超时最大重试次数，如果超时则将消息topic、队列等数据改为死信的，未超过则将消息的数据改为重试的，并设置延时级别**
+
+**在CommitLog追加数据前，会判断消息是否设置过延时级别，如果设置过则又会将消息的topic、队列等数据改为延时的，并保存之前重试队列的数据，持久化消息后，异步写ComsumerQueue，相当于消息被投入延时队列中，等到延时时间结束后，消息会被投入重试队列**
+
+**消费者的再平衡机制会将这个重试队列对应的PullRequest请求加入，后续再进行拉取消息并进行消费，以此达成消费重试机制**
+
+
+
+#### 最后（点赞、收藏、关注求求啦\~）
+
+本篇文章被收入专栏 [消息中间件](https://juejin.cn/column/7405771885327892532)，感兴趣的同学可以持续关注喔
+
+本篇文章笔记以及案例被收入 [Gitee-CaiCaiJava](https://gitee.com/tcl192243051/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)、 [Github-CaiCaiJava](https://github.com/Tc-liang/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)，除此之外还有更多Java进阶相关知识，感兴趣的同学可以starred持续关注喔\~
+
+有什么问题可以在评论区交流，如果觉得菜菜写的不错，可以点赞、关注、收藏支持一下\~
+
+关注菜菜，分享更多技术干货，公众号：菜菜的后端私房菜
+
+
+
+
+
+## RocketMQ（六）：Consumer Rebalanc原理解析（运行流程、触发时机、导致的问题）
+
+之前的文章已经说过拉取消息和并发消费消息的原理，其中消费者会根据要负责的队列进行消息的拉取以及消费，而再平衡机制就是决定消费者要负责哪些队列的
+
+RocketMQ设计上，一个队列只能被一个消费者进行消费，而消费者可以同时消费多个队列
+
+**Consumer Rebalance 消费者再平衡机制用于将队列负载均衡到消费者**
+
+可以把它理解成一个分配资源的动作，其中的资源就是队列，而把队列分配给哪些消费者负责就是再平衡机制决定的
+
+当消费者上/下线，队列动态扩容/缩容，都会导致触发再平衡机制，导致重新分配资源
+
+频繁触发可能会导致吞吐量降低、数据一致性等危害
+
+本篇文章就来聊聊Consumer Rebalance（再/重平衡）机制的原理以及危害和预防方式，思维导图如下：
+
+![思维导图](https://bbs-img.huaweicloud.com/blogs/img/20241105/1730770179185900288.png)
+
+
+
+> 往期好文：
+
+[RocketMQ（一）：消息中间件缘起，一览整体架构及核心组件](https://juejin.cn/post/7411686792342732841)
+
+[RocketMQ（二）：揭秘发送消息核心原理（源码与设计思想解析）](https://juejin.cn/post/7412672656363798591)
+
+[RocketMQ（三）：面对高并发请求，如何高效持久化消息？（核心存储文件、持久化核心原理、源码解析）](https://juejin.cn/post/7412922870521184256)
+
+[RocketMQ（四）：消费前如何拉取消息？（长轮询机制）](https://juejin.cn/post/7417635848987033615)
+
+[RocketMQ（五）：揭秘高吞吐量并发消费原理](https://juejin.cn/post/7433066208825524243)
+
+
+
+### 消费者再平衡 doRebalance 
+
+负责再平衡的组件是RebalanceImpl，对应推拉消费模式，它也有推拉的实现：RebalancePushImpl、RebalanceLitePullImpl
+
+还是以推的消费来查看源码，也就是DefaultMQPushConsumerImpl与RebalancePushImpl
+
+> doRebalance
+
+**`doRebalance`方法是再平衡的开始方法，会根据每个Topic进行再平衡**
+
+（同一个Topic下的一个队列虽然只能由一个消费者负责，但是消费者可以负责多个Topic的队列）
+
+```java
+public void doRebalance(final boolean isOrder) {
+    //获取当前消费者订阅信息
+    Map<String, SubscriptionData> subTable = this.getSubscriptionInner();
+    if (subTable != null) {
+        //遍历每个Topic 
+        for (final Map.Entry<String, SubscriptionData> entry : subTable.entrySet()) {
+            final String topic = entry.getKey();
+            try {
+                //根据Topic进行再平衡
+                this.rebalanceByTopic(topic, isOrder);
+            } catch (Throwable e) {
+                if (!topic.startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX)) {
+                    log.warn("rebalanceByTopic Exception", e);
+                }
+            }
+        }
+    }
+
+    //清理不再需要的ProcessorQueue(没在该消费者订阅Topic)
+    this.truncateMessageQueueNotMyTopic();
+}
+```
+
+**进行完再平衡后，会调用`truncateMessageQueueNotMyTopic`清理不再需要的ProcessorQueue**
+
+分析前必须要知道：**PullRequest、ProcessorQueue与MessageQueue一一对应，PullRequest用于拉取消息，拉取到消息将消息放入ProcessorQueue中后续进行消费，MessageQueue为操作它们时相当于操作（拉取消息、消费消息）哪个队列** （我愿称它们为“黄金铁三角”，但它们没有武魂融合技）
+
+
+
+
+
+#### 根据Topic再平衡(核心方法) rebalanceByTopic 
+
+根据Topic进行再平衡是再平衡的核心方法，分为广播、集群模式进行处理
+
+**广播模式消费者要处理该Topic下所有的队列，而集群模式下会通过不同的策略来进行分配队列**
+
+集群模式下再平衡的流程为：
+
+1. **获取该Topic下所有队列`this.topicSubscribeInfoTable.get(topic)`**（内存获取，路由数据来源NameServer）
+2. **向Broker获取该Topic下消费者组中的所有消费者（客户端ID） `this.mQClientFactory.findConsumerIdList(topic, consumerGroup)`**（由于消费者可能不在同一个节点上，但它们都会向Broker注册，因此要去Broker获取）
+3. **所有队列和消费者客户端ID排序后，使用分配队列策略进行分配队列，默认平均哈希算法 `strategy.allocate`**（比如三个队列，三个消费者就平均每个消费者一个队列，如果是四个队列，那第一个消费者就多负责个队列）
+4. **通过分配完的队列更新ProcessorQueue `this.updateProcessQueueTableInRebalance(topic, allocateResultSet, isOrder)`**（删除不需要再负责的ProcessorQueue以及新增需要负责的ProcessorQueue）
+5. **如果更新ProcessorQueue，还要改变队列的流控配置以及向所有Broker进行心跳 `this.messageQueueChanged(topic, mqSet, allocateResultSet)`**
+
+![再平衡集群模式主流程](https://bbs-img.huaweicloud.com/blogs/img/20240913/1726213489499634600.png)
+
+> rebalanceByTopic
+
+```java
+private void rebalanceByTopic(final String topic, final boolean isOrder) {
+    switch (messageModel) {
+        //广播模式
+        case BROADCASTING: {
+            //获取当前消费者要负责的队列即topic下所有队列（这些队列就是当前消费者要负责的，广播下就是topic下所有队列，消费者都要负责）
+            Set<MessageQueue> mqSet = this.topicSubscribeInfoTable.get(topic);
+            if (mqSet != null) {
+                //根据消费者要负责的队列更新ProcessQueue
+                boolean changed = this.updateProcessQueueTableInRebalance(topic, mqSet, isOrder);
+                if (changed) {
+                    //更新ProcessQueue成功还要更改对应的消息队列
+                    this.messageQueueChanged(topic, mqSet, mqSet);
+                    log.info("messageQueueChanged {} {} {} {}",
+                        consumerGroup,
+                        topic,
+                        mqSet,
+                        mqSet);
+                }
+            } else {
+                log.warn("doRebalance, {}, but the topic[{}] not exist.", consumerGroup, topic);
+            }
+            break;
+        }
+        case CLUSTERING: {
+            //获取该Topic下所有队列
+            Set<MessageQueue> mqSet = this.topicSubscribeInfoTable.get(topic);
+            //向Broker查询该Topic下的这个消费者组的所有消费者客户端ID，方便后续给消费者分配队列
+            List<String> cidAll = this.mQClientFactory.findConsumerIdList(topic, consumerGroup);
+
+            if (mqSet != null && cidAll != null) {
+                //所有队列 set->list
+                List<MessageQueue> mqAll = new ArrayList<MessageQueue>();
+                mqAll.addAll(mqSet);
+
+                //所有队列、消费者客户端ID排序 方便分配
+                Collections.sort(mqAll);
+                Collections.sort(cidAll);
+
+                //分配队列的策略 默认是AllocateMessageQueueAveragely平均哈希队列算法，在构建消费者DefaultMQPushConsumer时确定的
+                AllocateMessageQueueStrategy strategy = this.allocateMessageQueueStrategy;
+
+                //调用策略获取要分配给当前消费者的队列
+                List<MessageQueue> allocateResult = null;
+                try {
+                    allocateResult = strategy.allocate(
+                        this.consumerGroup,
+                        this.mQClientFactory.getClientId(),
+                        mqAll,
+                        cidAll);
+                } catch (Throwable e) {
+                    log.error("AllocateMessageQueueStrategy.allocate Exception. allocateMessageQueueStrategyName={}", strategy.getName(),
+                        e);
+                    return;
+                }
+
+                //要分配的队列 list->set
+                Set<MessageQueue> allocateResultSet = new HashSet<MessageQueue>();
+                if (allocateResult != null) {
+                    allocateResultSet.addAll(allocateResult);
+                }
+
+                //根据要分配的队列更新ProcessQueue
+                boolean changed = this.updateProcessQueueTableInRebalance(topic, allocateResultSet, isOrder);
+                if (changed) {
+                    //更新ProcessQueue同时改变MessageQueue
+                    this.messageQueueChanged(topic, mqSet, allocateResultSet);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+```
+
+
+
+
+
+#### 查询所有消费者ID findConsumerIdList 
+
+在向Broker查当前Topic、消费者组下所有消费者ID时，也是老套路：
+
+1. **先多级缓存查Broker地址信息，本地查不到就去NameServer**
+2. **再通过API RPC请求Broker，其中请求码为`GET_CONSUMER_LIST_BY_GROUP`**
+
+```java
+public List<String> findConsumerIdList(final String topic, final String group) {
+    //多级缓存查broker
+    String brokerAddr = this.findBrokerAddrByTopic(topic);
+    if (null == brokerAddr) {
+        this.updateTopicRouteInfoFromNameServer(topic);
+        brokerAddr = this.findBrokerAddrByTopic(topic);
+    }
+
+    if (null != brokerAddr) {
+        try {
+            //API请求
+            return this.mQClientAPIImpl.getConsumerIdListByGroup(brokerAddr, group, clientConfig.getMqClientApiTimeout());
+        } catch (Exception e) {
+            log.warn("getConsumerIdListByGroup exception, " + brokerAddr + " " + group, e);
+        }
+    }
+
+    return null;
+}
+```
+
+
+
+
+
+#### 平均哈希算法分配队列 AllocateMessageQueueAveragely.allocate 
+
+**平均哈希算法就是每个消费者先平均负责相同的队列，如果此时还有队列多出就按照消费者顺序依次多分配一个队列**
+
+```java
+@Override
+public List<MessageQueue> allocate(String consumerGroup, String currentCID, List<MessageQueue> mqAll,
+    List<String> cidAll) {
+    //校验
+    //...
+    List<MessageQueue> result = new ArrayList<MessageQueue>();
+
+	//当前消费者下标
+    int index = cidAll.indexOf(currentCID);
+    //模 相当于平均后多出来的队列
+    int mod = mqAll.size() % cidAll.size();
+    //得到平均值 如果mod > 0 并且 index < mod 说明平均后有队列多出来，index在mod前的消费者都要多分配一个队列
+    int averageSize =
+        mqAll.size() <= cidAll.size() ? 1 : (mod > 0 && index < mod ? mqAll.size() / cidAll.size()
+            + 1 : mqAll.size() / cidAll.size());
+    //开始的下标
+    int startIndex = (mod > 0 && index < mod) ? index * averageSize : index * averageSize + mod;
+    //加入队列的范围
+    int range = Math.min(averageSize, mqAll.size() - startIndex);
+    for (int i = 0; i < range; i++) {
+        result.add(mqAll.get((startIndex + i) % mqAll.size()));
+    }
+    return result;
+}
+```
+
+需要注意的是这里的cidAll是同组消费者ID列表，**如果多消费者组同时订阅相同的Topic（包括tag也相同），那么消费时会导致各消费者组都有消费者进行消息消费**
+
+
+
+#### 根据分配队列更新ProcessQueue(updateProcessQueueTableInRebalance)
+
+**先将不用负责的与拉取超时的ProcessQueue进行删除**（topic相同，但其对应的mq不在分配的mq中）
+
+**如果有需要新增的ProcessQueue，会先删除本地存储broker该队列消费偏移量，再从broker请求该队列最新的消费偏移量**（之前拉取消息文章中已经分析过此流程）
+
+**新增ProcessQueue时，如果之前没有维护过mq与ProcessQueue的对应关系，还要新增PullRequest，最后将PullRequest返回队列，便于后续拉取消息**
+
+```java
+private boolean updateProcessQueueTableInRebalance(final String topic, final Set<MessageQueue> mqSet,
+    final boolean isOrder) {
+    boolean changed = false;
+	
+    //当前消费者的processQueueTable迭代器
+    Iterator<Entry<MessageQueue, ProcessQueue>> it = this.processQueueTable.entrySet().iterator();
+    while (it.hasNext()) {
+        Entry<MessageQueue, ProcessQueue> next = it.next();
+        MessageQueue mq = next.getKey();
+        ProcessQueue pq = next.getValue();
+
+        if (mq.getTopic().equals(topic)) {
+            //topic相同 但是mq不在分配的队列中就删除
+            if (!mqSet.contains(mq)) {
+                pq.setDropped(true);
+                if (this.removeUnnecessaryMessageQueue(mq, pq)) {
+                    it.remove();
+                    changed = true;
+                    log.info("doRebalance, {}, remove unnecessary mq, {}", consumerGroup, mq);
+                }
+            } else if (pq.isPullExpired()) {
+                switch (this.consumeType()) {
+                    case CONSUME_ACTIVELY:
+                        break;
+                    case CONSUME_PASSIVELY:
+                        //拉取超时 默认120s 推的情况下删除
+                        pq.setDropped(true);
+                        if (this.removeUnnecessaryMessageQueue(mq, pq)) {
+                            it.remove();
+                            changed = true;
+                            log.error("[BUG]doRebalance, {}, remove unnecessary mq, {}, because pull is pause, so try to fixed it",
+                                consumerGroup, mq);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+    }
+
+    List<PullRequest> pullRequestList = new ArrayList<PullRequest>();
+    for (MessageQueue mq : mqSet) {
+        //新增的队列要添加对应的ProcessQueue
+        if (!this.processQueueTable.containsKey(mq)) {
+			//先删除内存中存储的偏移量
+            this.removeDirtyOffset(mq);
+            
+            ProcessQueue pq = new ProcessQueue();
+            long nextOffset = -1L;
+            try {
+                //向Broker获取该队列的消费偏移量
+                nextOffset = this.computePullFromWhereWithException(mq);
+            } catch (Exception e) {
+                log.info("doRebalance, {}, compute offset failed, {}", consumerGroup, mq);
+                continue;
+            }
+
+            if (nextOffset >= 0) {
+                //添加ProcessQueue 如果之前不存在还要添加PullRequest
+                //（PullRequest拉取消息、ProcessQueue存储消息、MessageQueue一一对应）
+                ProcessQueue pre = this.processQueueTable.putIfAbsent(mq, pq);
+                if (pre != null) {
+                    log.info("doRebalance, {}, mq already exists, {}", consumerGroup, mq);
+                } else {
+                    log.info("doRebalance, {}, add a new mq, {}", consumerGroup, mq);
+                    PullRequest pullRequest = new PullRequest();
+                    pullRequest.setConsumerGroup(consumerGroup);
+                    pullRequest.setNextOffset(nextOffset);
+                    pullRequest.setMessageQueue(mq);
+                    pullRequest.setProcessQueue(pq);
+                    pullRequestList.add(pullRequest);
+                    changed = true;
+                }
+            } else {
+                log.warn("doRebalance, {}, add new mq failed, {}", consumerGroup, mq);
+            }
+        }
+    }
+
+    //PullRequest放入队列，方便后续进行拉取消息
+    this.dispatchPullRequest(pullRequestList);
+
+    return changed;
+}
+```
+
+
+
+
+
+#### 消息队列更改 messageQueueChanged
+
+**如果删除过ProcessorQueue或新增过PullRequest，都要对队列的消息数量、大小流控进行更改，并加锁通知所有Broker**
+
+**最终调用API请求码：HEART_BEAT向Broker进行心跳**
+
+> RebalancePushImpl.messageQueueChanged
+
+```java
+public void messageQueueChanged(String topic, Set<MessageQueue> mqAll, Set<MessageQueue> mqDivided) {
+    /**
+     * When rebalance result changed, should update subscription's version to notify broker.
+     * Fix: inconsistency subscription may lead to consumer miss messages.
+     */
+    SubscriptionData subscriptionData = this.subscriptionInner.get(topic);
+    long newVersion = System.currentTimeMillis();
+    log.info("{} Rebalance changed, also update version: {}, {}", topic, subscriptionData.getSubVersion(), newVersion);
+    subscriptionData.setSubVersion(newVersion);
+
+    //当前队列数量
+    int currentQueueCount = this.processQueueTable.size();
+    if (currentQueueCount != 0) {
+        //更改消息数量流控：topic最多允许拉多少消息
+        int pullThresholdForTopic = this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdForTopic();
+        if (pullThresholdForTopic != -1) {
+            //每个队列允许存多少消息 
+            int newVal = Math.max(1, pullThresholdForTopic / currentQueueCount);
+            log.info("The pullThresholdForQueue is changed from {} to {}",
+                this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdForQueue(), newVal);
+            this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().setPullThresholdForQueue(newVal);
+        }
+
+        //更改消息大小流控 与数量类似
+        int pullThresholdSizeForTopic = this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdSizeForTopic();
+        if (pullThresholdSizeForTopic != -1) {
+            int newVal = Math.max(1, pullThresholdSizeForTopic / currentQueueCount);
+            log.info("The pullThresholdSizeForQueue is changed from {} to {}",
+                this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdSizeForQueue(), newVal);
+            this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().setPullThresholdSizeForQueue(newVal);
+        }
+    }
+
+    // notify broker
+    //加锁通知所有broker
+    this.getmQClientFactory().sendHeartbeatToAllBrokerWithLock();
+}
+```
+
+**通知所有Broker时会将MQClientInstance记录的生产者、消费者都进行心跳**，因此要加锁避免重复
+
+
+
+
+
+### Broker处理
+
+再平衡过程中，Broker需要处理三种请求：
+
+1. 查询队列的消费偏移量（以前文章分析过，这里不分析）
+2. 查询消费者组下所有消费者
+3. 消费者心跳
+
+接下来依次分析Broker是如何处理的
+
+#### 查询消费者组下所有消费者
+
+请求码为`GET_CONSUMER_LIST_BY_GROUP`，处理的组件为ConsumerManageProcessor
+
+（之前也分析过用它来读写消费偏移量，马上它所有处理的请求就都要分析完了）
+
+```java
+@Override
+public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand request)
+    throws RemotingCommandException {
+    switch (request.getCode()) {
+        case RequestCode.GET_CONSUMER_LIST_BY_GROUP:
+            return this.getConsumerListByGroup(ctx, request);
+        case RequestCode.UPDATE_CONSUMER_OFFSET:
+            return this.updateConsumerOffset(ctx, request);
+        case RequestCode.QUERY_CONSUMER_OFFSET:
+            return this.queryConsumerOffset(ctx, request);
+        default:
+            break;
+    }
+    return null;
+}
+```
+
+**`getConsumerListByGroup`会使用ConsumerManager的consumerTable，根据消费者组获取ConsumerGroupInfo信息**
+
+```java
+ConcurrentMap<String/* Group */, ConsumerGroupInfo> consumerTable = new ConcurrentHashMap<String, ConsumerGroupInfo>(1024);
+
+ConsumerGroupInfo consumerGroupInfo =
+    this.brokerController.getConsumerManager().getConsumerGroupInfo(
+        requestHeader.getConsumerGroup());
+```
+
+**ConsumerGroupInfo中消费者的信息被封装为ClientChannelInfo存储在channelInfoTable中，其中就可以提取到消费者的客户端ID**
+
+```java
+private final ConcurrentMap<Channel, ClientChannelInfo> channelInfoTable = new ConcurrentHashMap<Channel, ClientChannelInfo>(16);
+```
+
+![Broker查询消费者组内消费者ID](https://bbs-img.huaweicloud.com/blogs/img/20240913/1726215621847522338.png)
+
+实现比较简单，其中的很多信息都是在心跳时更新的，接下来看下心跳的流程
+
+
+
+#### 心跳
+
+心跳的请求码为`HEART_BEAT`，由ClientManageProcessor负责处理，会调用`heartBeat`
+
+**处理心跳的过程中会先处理消费者的心跳再处理生产者心跳**
+
+```java
+public RemotingCommand heartBeat(ChannelHandlerContext ctx, RemotingCommand request) {
+    RemotingCommand response = RemotingCommand.createResponseCommand(null);
+    //心跳数据 分为消费者和生产者的心跳
+    HeartbeatData heartbeatData = HeartbeatData.decode(request.getBody(), HeartbeatData.class);
+    //客户端channel 方便后续通信交互
+    ClientChannelInfo clientChannelInfo = new ClientChannelInfo(
+        ctx.channel(),
+        heartbeatData.getClientID(),
+        request.getLanguage(),
+        request.getVersion()
+    );
+
+    //处理消费者心跳
+    for (ConsumerData data : heartbeatData.getConsumerDataSet()) {
+        //消费组订阅配置
+        SubscriptionGroupConfig subscriptionGroupConfig =
+            this.brokerController.getSubscriptionGroupManager().findSubscriptionGroupConfig(
+                data.getGroupName());
+        //消费组变更通知是否开启 后续变更通知组内消费者再平衡
+        boolean isNotifyConsumerIdsChangedEnable = true;
+        if (null != subscriptionGroupConfig) {
+            isNotifyConsumerIdsChangedEnable = subscriptionGroupConfig.isNotifyConsumerIdsChangedEnable();
+            int topicSysFlag = 0;
+            if (data.isUnitMode()) {
+                topicSysFlag = TopicSysFlag.buildSysFlag(false, true);
+            }
+            //创建重试队列的Topic
+            String newTopic = MixAll.getRetryTopic(data.getGroupName());
+            this.brokerController.getTopicConfigManager().createTopicInSendMessageBackMethod(
+                newTopic,
+                subscriptionGroupConfig.getRetryQueueNums(),
+                PermName.PERM_WRITE | PermName.PERM_READ, topicSysFlag);
+        }
+
+        //注册消费者
+        boolean changed = this.brokerController.getConsumerManager().registerConsumer(
+            data.getGroupName(),
+            clientChannelInfo,
+            data.getConsumeType(),
+            data.getMessageModel(),
+            data.getConsumeFromWhere(),
+            data.getSubscriptionDataSet(),
+            isNotifyConsumerIdsChangedEnable
+        );
+
+        if (changed) {
+            log.info("registerConsumer info changed {} {}",
+                data.toString(),
+                RemotingHelper.parseChannelRemoteAddr(ctx.channel())
+            );
+        }
+    }
+
+    //处理生产者心跳
+    for (ProducerData data : heartbeatData.getProducerDataSet()) {
+        this.brokerController.getProducerManager().registerProducer(data.getGroupName(),
+            clientChannelInfo);
+    }
+    response.setCode(ResponseCode.SUCCESS);
+    response.setRemark(null);
+    return response;
+}
+```
+
+**消费者的心跳最终调用`registerConsumer`判断消费者或者Topic订阅数据是否有改变，改变会通知组内消费者**
+
+```java
+public boolean registerConsumer(final String group, final ClientChannelInfo clientChannelInfo,
+    ConsumeType consumeType, MessageModel messageModel, ConsumeFromWhere consumeFromWhere,
+    final Set<SubscriptionData> subList, boolean isNotifyConsumerIdsChangedEnable) {
+
+    //获取消费者组信息
+    ConsumerGroupInfo consumerGroupInfo = this.consumerTable.get(group);
+    if (null == consumerGroupInfo) {
+        //没有就创建
+        ConsumerGroupInfo tmp = new ConsumerGroupInfo(group, consumeType, messageModel, consumeFromWhere);
+        ConsumerGroupInfo prev = this.consumerTable.putIfAbsent(group, tmp);
+        consumerGroupInfo = prev != null ? prev : tmp;
+    }
+
+    //改变客户端消费者channel
+    boolean r1 =
+        consumerGroupInfo.updateChannel(clientChannelInfo, consumeType, messageModel,
+            consumeFromWhere);
+    //改变订阅数据
+    boolean r2 = consumerGroupInfo.updateSubscription(subList);
+
+    if (r1 || r2) {
+        if (isNotifyConsumerIdsChangedEnable) {
+            //如果消费者或组内订阅有变通知其他消费者
+            this.consumerIdsChangeListener.handle(ConsumerGroupEvent.CHANGE, group, consumerGroupInfo.getAllChannel());
+        }
+    }
+
+    //通知已注册 更新消息过滤器的订阅数据
+    this.consumerIdsChangeListener.handle(ConsumerGroupEvent.REGISTER, group, subList);
+    return r1 || r2;
+}
+```
+
+**改变客户端channel实际上就是新增消费者的channel或覆盖已存在的channel，只有新增才算更改，才会后续通知**
+
+**这里的channelInfoTable就是查询消费组下消费者ID会用到的**
+
+```java
+public boolean updateChannel(final ClientChannelInfo infoNew, ConsumeType consumeType,
+    MessageModel messageModel, ConsumeFromWhere consumeFromWhere) {
+    boolean updated = false;
+    this.consumeType = consumeType;
+    this.messageModel = messageModel;
+    this.consumeFromWhere = consumeFromWhere;
+
+    ClientChannelInfo infoOld = this.channelInfoTable.get(infoNew.getChannel());
+    if (null == infoOld) {
+        //没有就创建
+        ClientChannelInfo prev = this.channelInfoTable.put(infoNew.getChannel(), infoNew);
+        if (null == prev) {
+            //以前也没有说明以前未注册过，改变成功
+            log.info("new consumer connected, group: {} {} {} channel: {}", this.groupName, consumeType,
+                messageModel, infoNew.toString());
+            updated = true;
+        }
+
+        infoOld = infoNew;
+    } else {
+        //客户端channel存在，但id不相等 则覆盖ClientChannelInfo
+        if (!infoOld.getClientId().equals(infoNew.getClientId())) {
+            log.error("[BUG] consumer channel exist in broker, but clientId not equal. GROUP: {} OLD: {} NEW: {} ",
+                this.groupName,
+                infoOld.toString(),
+                infoNew.toString());
+            this.channelInfoTable.put(infoNew.getChannel(), infoNew);
+        }
+    }
+
+    this.lastUpdateTimestamp = System.currentTimeMillis();
+    infoOld.setLastUpdateTimestamp(this.lastUpdateTimestamp);
+
+    return updated;
+}
+```
+
+**更改订阅数据就是新增当前组内没有的订阅Topic，以及删除当前组内不在需要订阅的Topic**
+
+```java
+public boolean updateSubscription(final Set<SubscriptionData> subList) {
+    boolean updated = false;
+	//topic订阅数据
+    for (SubscriptionData sub : subList) {
+        SubscriptionData old = this.subscriptionTable.get(sub.getTopic());
+        if (old == null) {
+            SubscriptionData prev = this.subscriptionTable.putIfAbsent(sub.getTopic(), sub);
+            if (null == prev) {
+                //以前不存在则更新成功
+                updated = true;
+                log.info("subscription changed, add new topic, group: {} {}",
+                    this.groupName,
+                    sub.toString());
+            }
+        } else if (sub.getSubVersion() > old.getSubVersion()) {
+            if (this.consumeType == ConsumeType.CONSUME_PASSIVELY) {
+                log.info("subscription changed, group: {} OLD: {} NEW: {}",
+                    this.groupName,
+                    old.toString(),
+                    sub.toString()
+                );
+            }
+			//时间戳新则覆盖
+            this.subscriptionTable.put(sub.getTopic(), sub);
+        }
+    }
+
+    //遍历当前组的订阅数据
+    Iterator<Entry<String, SubscriptionData>> it = this.subscriptionTable.entrySet().iterator();
+    while (it.hasNext()) {
+        Entry<String, SubscriptionData> next = it.next();
+        String oldTopic = next.getKey();
+
+        boolean exist = false;
+        for (SubscriptionData sub : subList) {
+            if (sub.getTopic().equals(oldTopic)) {
+                exist = true;
+                break;
+            }
+        }
+
+        //如果当前订阅数据有但心跳时没有的Topic要删除
+        if (!exist) {
+            log.warn("subscription changed, group: {} remove topic {} {}",
+                this.groupName,
+                oldTopic,
+                next.getValue().toString()
+            );
+
+            it.remove();
+            updated = true;
+        }
+    }
+
+    this.lastUpdateTimestamp = System.currentTimeMillis();
+
+    return updated;
+}
+```
+
+最后，**只有新增channel或订阅时才会调用`notifyConsumerIdsChanged`使用组内存储的客户端channel通知组内消费者**，请求码为`NOTIFY_CONSUMER_IDS_CHANGED`
+
+**客户端收到这个请求会唤醒定时再平衡的线程去触发再平衡**
+
+![Broker接收心跳](https://bbs-img.huaweicloud.com/blogs/img/20240913/1726215661927620814.png)
+
+**注册生产者的流程也是去维护生产者客户端channel的，通过客户端channel便于RPC通信**，这里就不过多赘述
+
+
+
+
+
+
+
+
+
+### 触发再平衡的时机
+
+**触发再平衡机制是由RebalanceService循环定时触发的，默认情况下是等待20s触发一次**
+
+```java
+//默认等待20S
+private static long waitInterval =
+        Long.parseLong(System.getProperty(
+            "rocketmq.client.rebalance.waitInterval", "20000"));
+
+public void run() {
+    while (!this.isStopped()) {
+        //等待
+        this.waitForRunning(waitInterval);
+        //触发再平衡
+        this.mqClientFactory.doRebalance();
+    }
+}
+```
+
+
+
+#### 消费者启动/上线通过定时任务触发再平衡
+
+**DefaultMQPushConsumerImpl消费者在启动时，会启动MQClientInstance，而MQClientInstance会去启动再平衡的定时任务RebalanceService**
+
+**但是RebalanceService会先等待再去触发再平衡，因此在消费者启动最后的步骤会调用`rebalanceImmediately`唤醒RebalanceService，从而触发再平衡**
+
+```java
+public synchronized void start() throws MQClientException {
+    switch (this.serviceState) {
+        case CREATE_JUST:
+            //..
+            
+            //启动MQClientInstance 它会去启动RebalanceService
+            mQClientFactory.start();
+            this.serviceState = ServiceState.RUNNING;
+            break;
+        case RUNNING:
+        case START_FAILED:
+        case SHUTDOWN_ALREADY:
+            throw new MQClientException("The PushConsumer service state not OK, maybe started once, "
+                + this.serviceState
+                + FAQUrl.suggestTodo(FAQUrl.CLIENT_SERVICE_NOT_OK),
+                null);
+        default:
+            break;
+    }
+
+    this.updateTopicSubscribeInfoWhenSubscriptionChanged();
+    this.mQClientFactory.checkClientInBroker();
+    this.mQClientFactory.sendHeartbeatToAllBrokerWithLock();
+    //唤醒RebalanceService
+    this.mQClientFactory.rebalanceImmediately();
+}
+```
+
+**流程：启动->开始再平衡定时任务->等待->被消费者启动最后代码唤醒->触发再平衡->新的消费者通知Broker->Broker通知组内其他消费者再平衡**
+
+
+
+
+
+#### 消费者关闭/下线触发再平衡
+
+消费者关闭时也会触发各种组件的关闭方法，其中有三个与触发消费者重新再平衡有关的操作，根据时间流程如下：
+
+1. **mQClientFactory.shutdown：关闭MQClientInstance，会去关闭rebalanceService，从而唤醒rebalanceService触发再平衡**
+2. **rebalanceImpl.destroy：清理 processQueueTable，触发再平衡后processQueue会更改从而会给Broker心跳**
+3. **mQClientFactory.unregisterConsumer：注销消费者，给Broker心跳时会改变消费者，因此Broker会告诉其他消费者下线**
+
+```java
+//注销消费者 向broker发送注销请求 broker会给组内其他消费者下发再平衡
+this.mQClientFactory.unregisterConsumer(this.defaultMQPushConsumer.getConsumerGroup());
+```
+
+请求码为`UNREGISTER_CLIENT`
+
+```java
+public void unregisterConsumer(final String group, final ClientChannelInfo clientChannelInfo,
+    boolean isNotifyConsumerIdsChangedEnable) {
+    ConsumerGroupInfo consumerGroupInfo = this.consumerTable.get(group);
+    if (null != consumerGroupInfo) {
+        //销毁channel
+        consumerGroupInfo.unregisterChannel(clientChannelInfo);
+        if (consumerGroupInfo.getChannelInfoTable().isEmpty()) {
+            ConsumerGroupInfo remove = this.consumerTable.remove(group);
+            if (remove != null) {
+                this.consumerIdsChangeListener.handle(ConsumerGroupEvent.UNREGISTER, group);
+            }
+        }
+        //通知组内再平衡
+        if (isNotifyConsumerIdsChangedEnable) {
+            this.consumerIdsChangeListener.handle(ConsumerGroupEvent.CHANGE, group, consumerGroupInfo.getAllChannel());
+        }
+    }
+}
+```
+
+**流程：销毁消费者->Broker通知组内所有消费者再平衡**
+
+
+
+
+
+#### Broker通知消费者改变
+
+**消费者接收Broker通知组内消费者有改变时，又会去唤醒再平衡的线程，导致触发再平衡**
+
+```java
+public RemotingCommand notifyConsumerIdsChanged(ChannelHandlerContext ctx,
+    RemotingCommand request) throws RemotingCommandException {
+    //...
+    
+    //唤醒
+    this.mqClientFactory.rebalanceImmediately();
+    //
+    return null;
+}
+```
+
+
+
+
+
+
+
+#### MQClientInstance定时任务向Broker心跳
+
+MQClientInstance有个默认30S的**定时任务会向Broker进行心跳，消费者有改动也可能导致Broker下发再平衡机制**
+
+```java
+this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+
+    @Override
+    public void run() {
+        try {
+            MQClientInstance.this.cleanOfflineBroker();
+            MQClientInstance.this.sendHeartbeatToAllBrokerWithLock();
+        } catch (Exception e) {
+            log.error("ScheduledTask sendHeartbeatToAllBroker exception", e);
+        }
+    }
+}, 1000, this.clientConfig.getHeartbeatBrokerInterval(), TimeUnit.MILLISECONDS);
+```
+
+流程与触发时机总结如下图：
+
+![触发再平衡的时机](https://bbs-img.huaweicloud.com/blogs/img/20240913/1726216228974405673.png)
+
+
+
+
+
+### 上文遗留问题
+
+上篇文章描述消费消息，在消费失败时会进行重试，此时会进行延时最终把消息投递到重试Topic上
+
+那么重试Topic是如何触发再平衡，以及生成PullRequest继续走通后续拉取消息的流程呢？
+
+**DefaultMQPushConsumerImpl在启动时，会调用`copySubscription`，集群模式下会将消费组的重试Topic加入rebalanceImpl的内部订阅中**
+
+```java
+case CLUSTERING:
+    final String retryTopic = MixAll.getRetryTopic(this.defaultMQPushConsumer.getConsumerGroup());
+    SubscriptionData subscriptionData = FilterAPI.buildSubscriptionData(retryTopic, SubscriptionData.SUB_ALL);
+    this.rebalanceImpl.getSubscriptionInner().put(retryTopic, subscriptionData);
+    break;
+```
+
+**后续遍历topic进行再平衡时，也会遍历重试Topic从而能够拉取重试队列的消息进行消费重试**
+
+
+
+
+
+
+
+### 再平衡导致的问题
+
+从再平衡机制的流程不难看出，它牺牲部分一致性来满足流程中不阻塞的可用性，从而达到最终一致性
+
+**在程序启动、队列扩容/缩容、消费者上线/下线等场景下，都可能导致短暂的再平衡分配队列不一致的情况，从而导致消息会被延迟消费、可能被重复消费**
+
+如果要确保再平衡分配队列完全一致，不出现重复消费的情况，就只能处理再平衡阶段时通过停止拉取、消费等工作，牺牲可用性来换取一致性
+
+**虽然最终一致性的再平衡机制可能会出现短暂的负载不一致，但只需要消费者做幂等即可解决，而且再平衡期间满足可用性，不会影响性能**
+
+当线上需要在业务高峰期进行大量队列扩容，增强消费能力时会触发再平衡机制，可能影响吞吐量从而导致性能下降
+
+为了避免这种情况，可以新增topic、队列，在旧消费者组临时增加“转发消息”的消费者，将消息转发到新队列中实现水平扩容消费粒度
+
+
+
+
+
+
+
+
+
+### 总结
+
+**再平衡机制负责将队列负载均衡到消费者，是拉取消息、消费消息的前提**
+
+**再平衡通过牺牲一定的一致性（频繁触发可能负载不一致）来满足可用性，以此达到最终一致性，期间可能出现消息重复消费，因此消费要做幂等**
+
+**消费者触发再平衡时，先遍历订阅的Topic，并根据Topic进行再平衡，通过获取Topic下的所有队列，并向Broker获取同组的其他消费者，然后根据分配策略分配队列给当前消费者，再根据分配的队列更新ProcessQueue，如果ProcessQueue有更新则要维护MQ的流控并向所有Broker进行心跳**
+
+**Broker收到心跳后更新消费者的channel与订阅，如果有新增则会向同组消费者下发再平衡请求**
+
+**消费者上线/下线、队列的增加、减少都会触发组内消费者的再平衡，消费者的定时任务也会触发再平衡**
+
+**如果多消费者组同时订阅相同的Topic（包括tag也相同），那么消费时会导致各消费者组都有消费者进行消息消费**
+
+
+
+#### 最后（点赞、收藏、关注求求啦\~）
+
+本篇文章被收入专栏 [消息中间件](https://juejin.cn/column/7405771885327892532)，感兴趣的同学可以持续关注喔
+
+本篇文章笔记以及案例被收入 [Gitee-CaiCaiJava](https://gitee.com/tcl192243051/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)、 [Github-CaiCaiJava](https://github.com/Tc-liang/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)，除此之外还有更多Java进阶相关知识，感兴趣的同学可以starred持续关注喔\~
+
+有什么问题可以在评论区交流，如果觉得菜菜写的不错，可以点赞、关注、收藏支持一下\~
+
+关注菜菜，分享更多技术干货，公众号：菜菜的后端私房菜
+
 ## 末尾
