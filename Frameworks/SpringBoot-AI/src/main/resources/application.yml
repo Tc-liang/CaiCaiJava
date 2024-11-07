@@ -1,0 +1,9 @@
+spring:
+  application:
+    name: springboot-ai
+
+  cloud:
+    ai:
+      tongyi:
+        connection:
+          api-key: sk-8c8b8a71144641af86d2ca1a86761ca8
