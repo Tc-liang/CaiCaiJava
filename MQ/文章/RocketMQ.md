@@ -4298,4 +4298,917 @@ case CLUSTERING:
 
 关注菜菜，分享更多技术干货，公众号：菜菜的后端私房菜
 
+
+
+## RocketMQ（七）：消费者如何保证顺序消费？
+
+之前的文章已经描述过消费消息有并发、顺序两种方式，其中并发消费常用于无序消息中，而顺序消息用于有序消息
+
+顺序消费是确保消息严格有序的前提，当需要确保消息有序时需要采用顺序消费，否则会可能打破消息的有序性
+
+顺序消费较为复杂，会涉及到多种锁来保证顺序消费
+
+本篇文章就来描述顺序消费的原理，来看看RocketMQ是如何保证顺序消费的，导图如下：
+
+![本文导图](https://bbs-img.huaweicloud.com/blogs/img/20241108/1731058901772985108.png)
+
+> 往期好文：
+
+[RocketMQ（一）：消息中间件缘起，一览整体架构及核心组件](https://juejin.cn/post/7411686792342732841)
+
+[RocketMQ（二）：揭秘发送消息核心原理（源码与设计思想解析）](https://juejin.cn/post/7412672656363798591)
+
+[RocketMQ（三）：面对高并发请求，如何高效持久化消息？（核心存储文件、持久化核心原理、源码解析）](https://juejin.cn/post/7412922870521184256)
+
+[RocketMQ（四）：消费前如何拉取消息？（长轮询机制）](https://juejin.cn/post/7417635848987033615)
+
+[RocketMQ（五）：揭秘高吞吐量并发消费原理](https://juejin.cn/post/7433066208825524243)
+
+[RocketMQ（六）：Consumer Rebalanc原理（运行流程、触发时机、导致的问题）](https://juejin.cn/post/7433436835462791187)
+
+
+
+### 顺序消费原理
+
+#### 再平衡时加分布式锁
+
+在顺序消费下，再平衡机制为了让每个队列都只分配到一个消费者，要向Broker获取该队列的分布式锁
+
+再平衡更新ProcessQueue时，调用`updateProcessQueueTableInRebalance`新增时，如果是顺序的再平衡要先判断内存队列processQueue是否加分布式锁：
+
+```java
+		for (MessageQueue mq : mqSet) {
+        	//本地没有则要新增
+            if (!this.processQueueTable.containsKey(mq)) {
+                //如果顺序 要判断队列是否加锁， 未获取说明其他消费者已经获取由它负责，这里跳过
+                if (isOrder && !this.lock(mq)) {
+                    continue;
+                }
+
+               //新增略
+            }
+        }
+```
+
+
+
+> RebalanceImpl.lock
+
+加锁的流程：**获取Broker信息、调用lockBatchMQ向Broker申请给（批量）队列加分布式锁、将拿到锁队列对应的ProcessQueue设置为已加锁并更新获取锁的时间用于判断锁是否过期**
+
+```java
+public boolean lock(final MessageQueue mq) {
+    //获取Broker
+    FindBrokerResult findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(), MixAll.MASTER_ID, true);
+    if (findBrokerResult != null) {
+        LockBatchRequestBody requestBody = new LockBatchRequestBody();
+        requestBody.setConsumerGroup(this.consumerGroup);
+        requestBody.setClientId(this.mQClientFactory.getClientId());
+        requestBody.getMqSet().add(mq);
+
+        try {
+            //向Broker请求要加锁的队列 返回的结果就是获取到锁的队列
+            Set<MessageQueue> lockedMq =
+                this.mQClientFactory.getMQClientAPIImpl().lockBatchMQ(findBrokerResult.getBrokerAddr(), requestBody, 1000);
+            
+            //将获取到锁的队列对应的ProcessQueue的lock字段设置为true标识获取到分布式锁，并更新锁时间用于判断是否过期
+            for (MessageQueue mmqq : lockedMq) {
+                ProcessQueue processQueue = this.processQueueTable.get(mmqq);
+                if (processQueue != null) {
+                    processQueue.setLocked(true);
+                    processQueue.setLastLockTimestamp(System.currentTimeMillis());
+                }
+            }
+
+            boolean lockOK = lockedMq.contains(mq);
+            log.info("the message queue lock {}, {} {}",
+                lockOK ? "OK" : "Failed",
+                this.consumerGroup,
+                mq);
+            return lockOK;
+        } catch (Exception e) {
+            log.error("lockBatchMQ exception, " + mq, e);
+        }
+    }
+
+    return false;
+}
+```
+
+同时在ConsumeMessageOrderlyService组件启动时会开启**定时任务（默认20S）调用`lockAll`向Broker获取当前负责processQueue的分布式锁(如果已持有则相当于续期)**
+
+
+
+
+
+
+
+#### 顺序消费流程
+
+前文已经说过：PullRequest（拉取消息）与MessageQueue、ProcessQueue（内存中存储、消费消息）一一对应，关系密切
+
+在消费端流程中涉及三把锁，**MessageQueue的本地锁、ProcessQueue的分布式锁和本地锁**
+
+**PullRequest拉取消息到ProcessQueue后会提交异步消费消息，封装ConsumeRequest提交到线程池，其集群模式下的顺序消费流程为：**
+
+1. **获取该队列messageQueue本地锁加锁**（防止线程池并发消费同一队列）
+2. **校验是否持有processQueue分布式锁，如果未持有调用 `tryLockLaterAndReconsume` 延迟尝试加processQueue分布式锁并提交消费请求**【未获取到锁，说明其他节点已获取分布式锁，当前节点先延时3s再进行消费（可能是再平衡机制将该队列分配给其他节点）】
+3. **循环开始顺序消费消息，每次消费设置的最大消费消息数量，如果消费成功就循环消费，期间校验是否持有processQueue分布式锁，以及是否超时**（默认60S，超时延时提交消费请求，期间还会封装上下文和执行消费前后的钩子）
+4. **真正调用消息监听器进行消息消费时，需要获取processQueue的本地锁**（再平衡如果将队列分配给其他消费者，会删除该队列，加锁防止在删除的过程中可能并发进行消费，防止多节点的重复消费）
+5. **最后处理消费后的结果 `processConsumeResult`**
+
+![顺序消费流程](https://bbs-img.huaweicloud.com/blogs/img/20240919/1726716563551574057.png)
+
+```java
+@Override
+public void run() {
+    if (this.processQueue.isDropped()) {
+        log.warn("run, the message queue not be able to consume, because it's dropped. {}", this.messageQueue);
+        return;
+    }
+
+    //获取该队列本地内存锁的锁对象
+    final Object objLock = messageQueueLock.fetchLockObject(this.messageQueue);
+    //队列加锁
+    synchronized (objLock) {
+        //集群模式要获取分布式锁并且不过期 否则调用tryLockLaterAndReconsume延迟处理
+        if (MessageModel.BROADCASTING.equals(ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.messageModel())
+            || (this.processQueue.isLocked() && !this.processQueue.isLockExpired())) {
+            final long beginTime = System.currentTimeMillis();
+            //消费成功循环处理 直到失败延迟处理
+            for (boolean continueConsume = true; continueConsume; ) {
+				
+                //再次校验 没获取锁 或者 超时 都会调用tryLockLaterAndReconsume延迟处理 
+                //...
+
+                //如果循环超时则延时提交消费请求，后续重新消费
+                long interval = System.currentTimeMillis() - beginTime;
+                if (interval > MAX_TIME_CONSUME_CONTINUOUSLY) {
+                    ConsumeMessageOrderlyService.this.submitConsumeRequestLater(processQueue, messageQueue, 10);
+                    break;
+                }
+
+                
+                //每次最大消费消息数量
+                final int consumeBatchSize =
+                    ConsumeMessageOrderlyService.this.defaultMQPushConsumer.getConsumeMessageBatchMaxSize();
+                //从内存队列中获取要消费的消息
+                List<MessageExt> msgs = this.processQueue.takeMessages(consumeBatchSize);
+                //消息可能是重试的，重置为正常的topic
+                defaultMQPushConsumerImpl.resetRetryAndNamespace(msgs, defaultMQPushConsumer.getConsumerGroup());
+                if (!msgs.isEmpty()) {
+                    //顺序上下文
+                    final ConsumeOrderlyContext context = new ConsumeOrderlyContext(this.messageQueue);
+					//执行后的状态
+                    ConsumeOrderlyStatus status = null;
+
+                    //构建上下文 行前的钩子..
+
+                    long beginTimestamp = System.currentTimeMillis();
+                    ConsumeReturnType returnType = ConsumeReturnType.SUCCESS;
+                    boolean hasException = false;
+                    try {
+                        //消费前加processQueue本地锁
+                        this.processQueue.getConsumeLock().lock();
+                        if (this.processQueue.isDropped()) {
+                            log.warn("consumeMessage, the message queue not be able to consume, because it's dropped. {}",
+                                this.messageQueue);
+                            break;
+                        }
+
+                        //顺序消费消息
+                        status = messageListener.consumeMessage(Collections.unmodifiableList(msgs), context);
+                    } catch (Throwable e) {
+                        hasException = true;
+                    } finally {
+                        this.processQueue.getConsumeLock().unlock();
+                    }
+
+					//处理状态..
+                    
+                    //执行后的钩子..
+
+                    ConsumeMessageOrderlyService.this.getConsumerStatsManager()
+                        .incConsumeRT(ConsumeMessageOrderlyService.this.consumerGroup, messageQueue.getTopic(), consumeRT);
+
+                    //处理消费后的状态
+                    continueConsume = ConsumeMessageOrderlyService.this.processConsumeResult(msgs, status, context, this);
+                } else {
+                    continueConsume = false;
+                }
+            }
+        } else {
+            if (this.processQueue.isDropped()) {
+                log.warn("the message queue not be able to consume, because it's dropped. {}", this.messageQueue);
+                return;
+            }
+
+            ConsumeMessageOrderlyService.this.tryLockLaterAndReconsume(this.messageQueue, this.processQueue, 100);
+        }
+    }
+}
+```
+
+顺序消费过程中部分流程也与并发消费类似，只不过需要通过加锁的方式保证顺序消费
+
+
+
+> List<MessageExt> msgs = this.processQueue.takeMessages(consumeBatchSize);
+
+processQueue 存储消息的内存队列是由两个TreeMap实现的，Key为消息的偏移量作为顺序，优先消费先持久化的消息（偏移量小）
+
+**其中 `msgTreeMap` 存储拉取到内存的消息，`consumingMsgOrderlyTreeMap` 在顺序消费时才使用，取出消息时将消息存入该容器，消费失败时再将消息放回 `msgTreeMap` 后续重复进行消费**
+
+```java
+public List<MessageExt> takeMessages(final int batchSize) {
+    List<MessageExt> result = new ArrayList<MessageExt>(batchSize);
+    final long now = System.currentTimeMillis();
+    try {
+        //取出加写锁
+        this.treeMapLock.writeLock().lockInterruptibly();
+        this.lastConsumeTimestamp = now;
+        try {
+            if (!this.msgTreeMap.isEmpty()) {
+                for (int i = 0; i < batchSize; i++) {
+                    //取出首个节点 也就是偏移量小的消息
+                    Map.Entry<Long, MessageExt> entry = this.msgTreeMap.pollFirstEntry();
+                    if (entry != null) {
+                        result.add(entry.getValue());
+                        //加入consumingMsgOrderlyTreeMap
+                        consumingMsgOrderlyTreeMap.put(entry.getKey(), entry.getValue());
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            if (result.isEmpty()) {
+                consuming = false;
+            }
+        } finally {
+            this.treeMapLock.writeLock().unlock();
+        }
+    } catch (InterruptedException e) {
+        log.error("take Messages exception", e);
+    }
+
+    return result;
+}
+```
+
+
+
+> ProcessQueue.commit
+
+**处理消费成功的结果时会调用 `ProcessQueue.commit` 进行更新msgCount、msgSize等字段并清空consumingMsgOrderlyTreeMap，最后返回偏移量后续更新消费偏移量**
+
+```java
+public long commit() {
+    try {
+        this.treeMapLock.writeLock().lockInterruptibly();
+        try {
+            Long offset = this.consumingMsgOrderlyTreeMap.lastKey();
+            //维护  msgCount、msgSize
+            msgCount.addAndGet(0 - this.consumingMsgOrderlyTreeMap.size());
+            for (MessageExt msg : this.consumingMsgOrderlyTreeMap.values()) {
+                msgSize.addAndGet(0 - msg.getBody().length);
+            }
+            //清空
+            this.consumingMsgOrderlyTreeMap.clear();
+            if (offset != null) {
+                return offset + 1;
+            }
+        } finally {
+            this.treeMapLock.writeLock().unlock();
+        }
+    } catch (InterruptedException e) {
+        log.error("commit exception", e);
+    }
+
+    return -1;
+}
+```
+
+
+
+> ProcessQueue.makeMessageToConsumeAgain
+
+**处理失败则会调用 `ProcessQueue.makeMessageToConsumeAgain` 将取出的消息重新放回msgTreeMap，延迟后再尝试消费**
+
+```java
+public void makeMessageToConsumeAgain(List<MessageExt> msgs) {
+    try {
+        this.treeMapLock.writeLock().lockInterruptibly();
+        try {
+            for (MessageExt msg : msgs) {
+                //消息放回msgTreeMap
+                this.consumingMsgOrderlyTreeMap.remove(msg.getQueueOffset());
+                this.msgTreeMap.put(msg.getQueueOffset(), msg);
+            }
+        } finally {
+            this.treeMapLock.writeLock().unlock();
+        }
+    } catch (InterruptedException e) {
+        log.error("makeMessageToCosumeAgain exception", e);
+    }
+}
+```
+
+
+
+> processConsumeResult
+
+`processConsumeResult`根据消费状态处理结果大致分成成功与失败的情况：
+
+**如果是成功会取出消息偏移量并进行更新（调用`commit`）**
+
+```java
+//获取偏移量
+commitOffset = consumeRequest.getProcessQueue().commit();
+//更新
+if (commitOffset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {
+    this.defaultMQPushConsumerImpl.getOffsetStore().updateOffset(consumeRequest.getMessageQueue(), commitOffset, false);
+}
+```
+
+更新流程与并发消费使用的组件相同（这里不再说明，之前的文章已描述），也是定时向Broker更新消费偏移量的
+
+如果是失败则会把消息放回内存队列（调用`makeMessageToConsumeAgain`），然后再调用`submitConsumeRequestLater`延时提交消费请求（延时重新消费）
+
+与并发消费不同的是：**并发消费延时会放回Broker并且随着消费失败延时时间也会增加，而顺序消费一直都在内存中延时重试，如果一直消费失败会“卡住”导致消息堆积**
+
+总结顺序消费流程如下：
+
+![顺序消费流程](https://bbs-img.huaweicloud.com/blogs/img/20240919/1726716563551574057.png)
+
+
+
+
+
+#### Broker处理获取分布式锁
+
+**broker维护mqLockTable的双层Map，其中第一层Key为消费者组名，第二层为队列，值为锁实体**
+
+```java
+ConcurrentMap<String/* group */, ConcurrentHashMap<MessageQueue, LockEntry>> mqLockTable 
+```
+
+**队列的锁实体字段包含持有锁的客户端ID和获取锁的时间，用于判断某客户端是否持有锁**
+
+```java
+static class LockEntry {
+    private String clientId;
+    private volatile long lastUpdateTimestamp = System.currentTimeMillis();
+}
+```
+
+获取分布式锁的请求码为`LOCK_BATCH_MQ`，Broker使用AdminBrokerProcessor调用RebalanceLockManager的tryLockBatch进行处理：
+
+1. **遍历需要加锁的队列，调用`isLocked`判断消费者（客户端）是否已持有队列的锁**
+
+   （获取到队列对应的锁实体，通过锁实体记录的客户端ID与当前客户端ID是否相同，持有锁时间是否过期（60S）来判断当前是否为持有锁的状态，如果持有锁相当于获取锁成功并更新获取锁的时间，加入加锁队列集合，否则加入未加锁队列集合）
+
+2. **如果（客户端）有队列当前未持有锁，则要尝试获取锁**（操作期间为复合操作，broker使用本地锁保证原子性）
+
+3. **获取队列对应的锁实体判断是否持有锁**（为空说明为第一次获取锁直接创建，isLocked比较客户端ID并且未过期才算获取锁，isExpired已过期也可以获取锁，其他情况就是别的客户端已经获取锁）
+
+4. **返回获取锁的队列集合**
+
+![Broker处理批量加锁](https://bbs-img.huaweicloud.com/blogs/img/20240919/1726716658640468572.png)
+
+```java
+public Set<MessageQueue> tryLockBatch(final String group, final Set<MessageQueue> mqs,
+    final String clientId) {
+    //加锁队列集合
+    Set<MessageQueue> lockedMqs = new HashSet<MessageQueue>(mqs.size());
+    //未加锁队列集合
+    Set<MessageQueue> notLockedMqs = new HashSet<MessageQueue>(mqs.size());
+
+    for (MessageQueue mq : mqs) {
+        //判断队列上次加锁的客户端是否为当前客户端
+        if (this.isLocked(group, mq, clientId)) {
+            lockedMqs.add(mq);
+        } else {
+            notLockedMqs.add(mq);
+        }
+    }
+
+    //如果有的队列上次加锁的客户端不是当前客户端 则要尝试加锁（该期间可能别的客户端还在持有锁）
+    if (!notLockedMqs.isEmpty()) {
+        try {
+            //加锁保证原子性 （这里的锁是broker本地锁保证复合操作的原子性）
+            this.lock.lockInterruptibly();
+            try {
+                //根据消费组拿到对应队列与锁
+                ConcurrentHashMap<MessageQueue, LockEntry> groupValue = this.mqLockTable.get(group);
+                if (null == groupValue) {
+                    //初始化
+                    groupValue = new ConcurrentHashMap<>(32);
+                    this.mqLockTable.put(group, groupValue);
+                }
+
+                //遍历需要加锁的集合
+                for (MessageQueue mq : notLockedMqs) {
+                    LockEntry lockEntry = groupValue.get(mq);
+                    //锁实体为空说明第一次获取直接创建
+                    if (null == lockEntry) {
+                        lockEntry = new LockEntry();
+                        //设置获取锁的客户端ID （类似偏向锁）
+                        lockEntry.setClientId(clientId);
+                        groupValue.put(mq, lockEntry);
+                    }
+
+                    //如果持有锁的客户端ID相同并且未过期（60S）则更新持有锁时间
+                    if (lockEntry.isLocked(clientId)) {
+                        lockEntry.setLastUpdateTimestamp(System.currentTimeMillis());
+                        //加锁成功加入
+                        lockedMqs.add(mq);
+                        continue;
+                    }
+
+                    //当前持有锁的客户端ID
+                    String oldClientId = lockEntry.getClientId();
+					
+                    //如果已过期 则设置当前客户端为新获取锁的客户端
+                    if (lockEntry.isExpired()) {
+                        lockEntry.setClientId(clientId);
+                        lockEntry.setLastUpdateTimestamp(System.currentTimeMillis());
+                        //加锁成功加入
+                        lockedMqs.add(mq);
+                        continue;
+                    }
+
+					//其他情况 则有其他客户端已获取锁
+                }
+            } finally {
+                this.lock.unlock();
+            }
+        } catch (InterruptedException e) {
+            log.error("putMessage exception", e);
+        }
+    }
+
+    return lockedMqs;
+}
+```
+
+解锁流程同理，都是操作mqLockTable
+
+分布式锁过期时间在服务端Broker与客户端（消费者）不同：
+
+**客户端默认加锁时间为30S `rocketmq.client.rebalance.lockMaxLiveTime`**
+
+**客户端定时任务默认每20S进行锁续期 `rocketmq.client.rebalance.lockInterval`**
+
+**服务端默认加锁时间为60S `rocketmq.broker.rebalance.lockMaxLiveTime`**
+
+
+
+
+
+### 总结
+
+**顺序消费的流程与并发消息流程的类似，但为了确保消息有序、依次进行消费，期间会需要加多种锁**
+
+**顺序消费流程中会先对messageQueue加本地锁，这是为了确保线程池执行ConsumeRequest任务时只有一个线程执行**
+
+**然后检查要消费的队列processQueue是否持有分布式锁，这是为了确保再平衡机制时被多个节点的消费者重复消费消息**
+
+**如果未持有分布式锁会向Broker尝试加锁，并延时提交消费请求，后续重试**
+
+**如果持有分布式锁会开始循环消费，期间也会检查持有分布式锁、超时等情况，不满足条件就延时重试**
+
+**监听器消费消息时，还要持有processQueue的本地锁，这是为了防止当前消费者不再负责该队列的情况下会删除，不加锁并发删除时会导致重复消费**
+
+**使用消息监听器消费完消息后根据状态进行处理结果，如果成功则在内存中更新消费偏移量，后续再定时向Broker更新（与并发消费相同）**
+
+**如果失败则会将消息放回processQueue并延时提交消费请求后续重试，与并发消费不同（并发消费失败会延时，重投入重试队列再进行重试或加入死信队列，而顺序消息是一直在内存中重试，会阻塞后续消息）**
+
+**再平衡机制新增processQueue时，如果是顺序消费就会去尝试获取它的分布式锁（默认30S过期），并且有定时任务默认每20S进行分布式锁续期**
+
+**Broker使用锁实体作为processQueue的分布式锁，记录持有分布式锁的客户端以及过期时间（默认60S过期）**
+
+**每次需要对哪些队列进行加锁，只需要判断队列对应的锁实体客户端ID以及过期时间即可**
+
+
+
+#### 最后（点赞、收藏、关注求求啦\~）
+
+我是菜菜，热爱技术交流、分享与写作，喜欢图文并茂、通俗易懂的输出知识
+
+本篇文章被收入专栏 [消息中间件](https://juejin.cn/column/7405771885327892532)，感兴趣的同学可以持续关注喔
+
+本篇文章笔记以及案例被收入 [Gitee-CaiCaiJava](https://gitee.com/tcl192243051/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)、 [Github-CaiCaiJava](https://github.com/Tc-liang/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)，除此之外还有更多Java进阶相关知识，感兴趣的同学可以starred持续关注喔\~
+
+有什么问题可以在评论区交流，如果觉得菜菜写的不错，可以点赞、关注、收藏支持一下\~
+
+关注菜菜，分享更多技术干货，公众号：菜菜的后端私房菜
+
+
+
+
+
+
+
+
+
+## RocketMQ（八）：轻量级拉取消费原理
+
+前几篇文章，我们从DefaultMQPushConsumer从再平衡给消费者分配队列开始、再到消费者拉取消息、最后通过并发/顺序的方式消费消息，已经完全描述它的实现原理
+
+虽然它取名为"Push"，但内部实现获取消息依旧是使用拉取的方式，只是增加了长轮询机制
+
+这样取名只是为了想表达它的消息会被“推送”到消息监听器上，而我们只需要实现自己的消息监听器来处理消息
+
+这篇文章我们使用“逆推”的思维，来看看消费者的另一个实现DefaultLitePullConsumer是如何实现轻量级拉取消费的
+
+本文思维导图如下：
+
+![思维导图](https://bbs-img.huaweicloud.com/blogs/img/20241113/1731462958628829804.png)
+
+> 往期回顾：
+
+[RocketMQ（七）：消费者如何保证顺序消费？](https://juejin.cn/post/7435651780329734207)
+
+[RocketMQ（六）：Consumer Rebalanc原理（运行流程、触发时机、导致的问题）](https://juejin.cn/post/7433436835462791187)
+
+[RocketMQ（五）：揭秘高吞吐量并发消费原理](https://juejin.cn/post/7433066208825524243)
+
+[RocketMQ（四）：消费前如何拉取消息？（长轮询机制）](https://juejin.cn/post/7417635848987033615)
+
+[RocketMQ（三）：面对高并发请求，如何高效持久化消息？（核心存储文件、持久化核心原理、源码解析）](https://juejin.cn/post/7412922870521184256)
+
+[RocketMQ（二）：揭秘发送消息核心原理（源码与设计思想解析）](https://juejin.cn/post/7412672656363798591)
+
+[RocketMQ（一）：消息中间件缘起，一览整体架构及核心组件](https://juejin.cn/post/7411686792342732841)
+
+
+
+
+
+### 使用DefaultLitePullConsumer
+
+DefaultLitePullConsumer使用起来与DefaultMQPushConsumer略有不同
+
+**它不需要再配置消息监听器（因为需要手动去拉取），启动后通过调用它的`poll`方法来手动拉取消息进行处理**
+
+```java
+			DefaultLitePullConsumer consumer = new DefaultLitePullConsumer();
+
+            //根据配置文件set...
+			consumer.setConsumerGroup(groupName);
+            consumer.subscribe(topic, tag);
+            consumer.setNamesrvAddr("127.0.0.1:9876");
+            consumer.start();
+
+            executor.execute(() -> {
+                while (true) {
+                    //拉取消息
+                    List<MessageExt> poll = consumer.poll();
+                    log.info("{}拉取消息:{}", groupName, poll);
+                }
+            });
+```
+
+
+
+### 实现原理
+
+熟悉过DefaultMQPushConsumer的我们肯定对消费的整体流程不会陌生，无非就是需要做到以下三点：
+
+1. 再分配机制如何给同组消费者负载均衡分配队列？
+2. 如何拉取消息？
+3. 如何消费消息？
+
+授人以鱼不如授人以渔，这次我们直接以`poll`为入口，“逆推”其实现的原理
+
+（面对没有文档、没有自顶向下的架构、不熟悉的源码都可以使用这种方式进行“推理”，找一个熟悉的业务实现点，往前寻找）
+
+
+
+#### poll 获取消息
+
+poll无参方法默认会携带5S的超时时间来进行调用，因此我们可以猜测如果没有消息到达就是每5s拉取一次消息
+
+每个方法依次查看会发现它会进行**检查、自动提交、从内存中获取消息请求ConsumeRequest，最后再获取本次消费的消息以及维护数据**（更新偏移量、重置topic）
+
+![poll获取消息](https://bbs-img.huaweicloud.com/blogs/img/20240920/1726819808748336886.png)
+
+```java
+public synchronized List<MessageExt> poll(long timeout) {
+    try {
+        //检查服务状态
+        checkServiceState();
+        //校验参数
+        if (timeout < 0) {
+            throw new IllegalArgumentException("Timeout must not be negative");
+        }
+
+        //自动提交 
+        if (defaultLitePullConsumer.isAutoCommit()) {
+            maybeAutoCommit();
+        }
+        long endTime = System.currentTimeMillis() + timeout;
+
+        //获取消费请求
+        ConsumeRequest consumeRequest = consumeRequestCache.poll(endTime - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
+
+        //未超时
+        if (endTime - System.currentTimeMillis() > 0) {
+            //如果获取消费请求但processQueue已弃用要重新获取 直到超时
+            while (consumeRequest != null && consumeRequest.getProcessQueue().isDropped()) {
+                consumeRequest = consumeRequestCache.poll(endTime - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
+                if (endTime - System.currentTimeMillis() <= 0) {
+                    break;
+                }
+            }
+        }
+
+        //获取到消费请求并且队列对应的processQueue未弃用 获取消息并维护其他状态
+        if (consumeRequest != null && !consumeRequest.getProcessQueue().isDropped()) {
+			//获取拉取到的消息
+            List<MessageExt> messages = consumeRequest.getMessageExts();
+            //内存队列中删除这批消息
+            long offset = consumeRequest.getProcessQueue().removeMessage(messages);
+            //更新偏移量
+            assignedMessageQueue.updateConsumeOffset(consumeRequest.getMessageQueue(), offset);
+            //If namespace not null , reset Topic without namespace.
+            //消息重置topic 可能之前是从其他特殊队列出来的？
+            this.resetTopic(messages);
+            return messages;
+        }
+    } catch (InterruptedException ignore) {
+
+    }
+
+    return Collections.emptyList();
+}
+```
+
+
+
+> DefaultLitePullConsumerImpl.commitAll
+
+查看自动提交的方法可以发现：**在自动提交中，如果当前时间超过下次自动提交的时间（默认每隔5S）就会调用 `commitAll` **（从之前看过的源码，可以猜测这个Commit会去更新偏移量或持久化相关的操作）
+
+```java
+public synchronized void commitAll() {
+    try {
+        //遍历队列
+        for (MessageQueue messageQueue : assignedMessageQueue.messageQueues()) {
+            //获取队列的消费偏移量
+            long consumerOffset = assignedMessageQueue.getConsumerOffset(messageQueue);
+            if (consumerOffset != -1) {
+                ProcessQueue processQueue = assignedMessageQueue.getProcessQueue(messageQueue);
+                if (processQueue != null && !processQueue.isDropped()) {
+                    //更新消费偏移量
+                    updateConsumeOffset(messageQueue, consumerOffset);
+                }
+            }
+        }
+        
+        //如果是广播模式则全部持久化
+        if (defaultLitePullConsumer.getMessageModel() == MessageModel.BROADCASTING) {
+            offsetStore.persistAll(assignedMessageQueue.messageQueues());
+        }
+    } catch (Exception e) {
+        log.error("An error occurred when update consume offset Automatically.");
+    }
+}
+```
+
+虽然目前不太理解assignedMessageQueue队列是干嘛的，但从名字可以看出可能是再平衡给当前消费者负载均衡分配的队列
+
+这个方法看上去**像兜底的更新消费偏移量（广播下持久化），某些情况下会遗漏，则每次获取消息时检查超时5S就进行兜底更新**
+
+而`consumeRequestCache.poll` 从名称上看就像是专门存储consumeRequestCache的缓存
+
+之前的文章也说过ConsumeRequest封装的消费请求，其中包含本次消费的消息列表以及对应的队列MessageQueue和ProcessQueue
+
+```java
+BlockingQueue<ConsumeRequest> consumeRequestCache = new LinkedBlockingQueue<ConsumeRequest>()
+```
+
+而存储ConsumeRequest的ConsumeRequestCache是阻塞队列，那就是明显的生产者、消费者模式
+
+接下来只需要看看什么场景下会将ConsumeRequest放入阻塞队列，即可“逆推”出拉取消息的流程
+
+
+
+
+
+#### pull 拉取消息
+
+ConsumeRequestCache.put的方法只有一处就是提交消费请求
+
+```java
+private void submitConsumeRequest(ConsumeRequest consumeRequest) {
+    try {
+        consumeRequestCache.put(consumeRequest);
+    } catch (InterruptedException e) {
+        log.error("Submit consumeRequest error", e);
+    }
+}
+```
+
+而该方法在什么时机下会被调用，相信看过前几篇文章的同学们都很熟悉（即拉取到消息后），这个方法是在执行PullTaskImpl任务中找到消息后被调用的
+
+
+
+> PullTaskImpl
+
+通过名字也可以猜测PullTaskImpl任务就是拉取消息的任务
+
+通过方法可以看出：**期间也会去做检查、流控，然后获取队列拉取偏移量进行拉取消息，拉到消息后将消息放入processQueue并封装消费请求进行提交，通知后续消息消费流程**
+
+![拉取消息任务](https://bbs-img.huaweicloud.com/blogs/img/20240920/1726821176436802237.png)
+
+```java
+public void run() {
+    if (!this.isCancelled()) {
+        this.currentThread = Thread.currentThread();
+
+        //队列暂停 延时1S重试
+        if (assignedMessageQueue.isPaused(messageQueue)) {
+            scheduledThreadPoolExecutor.schedule(this, PULL_TIME_DELAY_MILLS_WHEN_PAUSE, TimeUnit.MILLISECONDS);
+            return;
+        }
+
+        //流控检查 不满足延时重试
+        //...
+        
+        long offset = 0L;
+        try {
+            //获取队列下次拉取的偏移量
+            offset = nextPullOffset(messageQueue);
+        } catch (Exception e) {
+            //失败延时重试
+            scheduledThreadPoolExecutor.schedule(this, PULL_TIME_DELAY_MILLS_ON_EXCEPTION, TimeUnit.MILLISECONDS);
+            return;
+        }
+        
+        long pullDelayTimeMills = 0;
+        try {
+            SubscriptionData subscriptionData;
+            String topic = this.messageQueue.getTopic();
+            //订阅数据
+            if (subscriptionType == SubscriptionType.SUBSCRIBE) {
+                subscriptionData = rebalanceImpl.getSubscriptionInner().get(topic);
+            } else {
+                subscriptionData = FilterAPI.buildSubscriptionData(topic, SubscriptionData.SUB_ALL);
+            }
+
+            //拉取消息
+            PullResult pullResult = pull(messageQueue, subscriptionData, offset, defaultLitePullConsumer.getPullBatchSize());
+            if (this.isCancelled() || processQueue.isDropped()) {
+                return;
+            }
+            switch (pullResult.getPullStatus()) {
+                case FOUND:
+                    //找到消息的情况 队列加锁
+                    final Object objLock = messageQueueLock.fetchLockObject(messageQueue);
+                    synchronized (objLock) {
+                        if (pullResult.getMsgFoundList() != null && !pullResult.getMsgFoundList().isEmpty() && assignedMessageQueue.getSeekOffset(messageQueue) == -1) {
+                            //拉取到的消息放入processQueue
+                            processQueue.putMessage(pullResult.getMsgFoundList());
+                            //封装消费请求并提交
+                            submitConsumeRequest(new ConsumeRequest(pullResult.getMsgFoundList(), messageQueue, processQueue));
+                        }
+                    }
+                    break;
+                case OFFSET_ILLEGAL:
+                    break;
+                default:
+                    break;
+            }
+            //更新拉取偏移量
+            updatePullOffset(messageQueue, pullResult.getNextBeginOffset(), processQueue);
+        } catch (InterruptedException interruptedException) {
+        } catch (Throwable e) {
+            pullDelayTimeMills = pullTimeDelayMillsWhenException;
+        }
+	
+        
+		if (!this.isCancelled()) {
+            //未取消继续延时拉取
+            scheduledThreadPoolExecutor.schedule(this, pullDelayTimeMills, TimeUnit.MILLISECONDS);
+        } else {
+        }
+    }
+}
+```
+
+**在通过队列获取偏移量时，优先使用seek手动设置的偏移量作为消费偏移量，然后再考虑拉取的偏移量，如果内存中拉取偏移量未设置要向broker获取**
+
+```java
+private long nextPullOffset(MessageQueue messageQueue) throws MQClientException {
+    long offset = -1;
+    //优先使用手动设置的偏移量
+    long seekOffset = assignedMessageQueue.getSeekOffset(messageQueue);
+    if (seekOffset != -1) {
+        offset = seekOffset;
+        //手动设置则将其更新为消费偏移量
+        assignedMessageQueue.updateConsumeOffset(messageQueue, offset);
+        assignedMessageQueue.setSeekOffset(messageQueue, -1);
+    } else {
+        //然后考虑拉取偏移量
+        offset = assignedMessageQueue.getPullOffset(messageQueue);
+        if (offset == -1) {
+            //拉取偏移量未设置则向broker获取
+            offset = fetchConsumeOffset(messageQueue);
+        }
+    }
+    return offset;
+}
+```
+
+**pull拉取消息的方法中，最终会采用同步的方式向Broker拉取数据（默认10S超时）`pullMessageSync`** （DefaultMQPushConsumer拉取消息采用的是异步）
+
+（如果Broker没有消息的话也是长轮询机制的流程，有消息到达会拉取完再返回，长轮询机制在拉取消息的文章中也说过这里就不过多叙述）
+
+**最终更新完偏移量，只要任务未被取消则会继续执行该任务** `scheduledThreadPoolExecutor.schedule(this, pullDelayTimeMills, TimeUnit.MILLISECONDS)`
+
+
+
+
+
+
+
+#### 再平衡触发拉取消息任务
+
+拉取流程也是类似的，只是有的细节实现不同，那么再来看看何时会触发PullTaskImpl任务
+
+PullTaskImpl任务被构造的方法有两处：
+
+1. seek手动更改偏移量时，构造PullTaskImpl任务后异步执行拉取消息
+2. **再平衡机制触发**
+
+**集群模式下会根据Topic进行再平衡，如果更新processQueue，队列需要更改时会调用`messageQueueChanged`**
+
+（之前再平衡的文章分析过该流程，只是推和拉的具体实现不同，这里简单回顾下）
+
+```java
+//根据分配的队列
+boolean changed = this.updateProcessQueueTableInRebalance(topic, allocateResultSet, isOrder);
+if (changed) {
+    //更改过后还需要更新队列 维护拉取任务
+    this.messageQueueChanged(topic, mqSet, allocateResultSet);
+}
+```
+
+**最终调用`updatePullTask`更新拉取任务，将不需要负责的队列任务取消，新增需要负责的队列任务启动**
+
+```java
+private void updatePullTask(String topic, Set<MessageQueue> mqNewSet) {
+    Iterator<Map.Entry<MessageQueue, PullTaskImpl>> it = this.taskTable.entrySet().iterator();
+    while (it.hasNext()) {
+        Map.Entry<MessageQueue, PullTaskImpl> next = it.next();
+        if (next.getKey().getTopic().equals(topic)) {
+            if (!mqNewSet.contains(next.getKey())) {
+                //取消不再负责队列的拉取任务
+                next.getValue().setCancelled(true);
+                it.remove();
+            }
+        }
+    }
+    //新增并启动需要负责队列的拉取任务
+    startPullTask(mqNewSet);
+}
+```
+
+**至此拉取消息的定时任务就会被再平衡机制给启动**
+
+![再平衡更新拉取任务](https://bbs-img.huaweicloud.com/blogs/img/20240920/1726822683844255133.png)
+
+**虽然拉取消息的任务是同步拉取，但是是放在线程池中执行的，并不会阻塞其他队列的拉取**
+
+**向Broker更新消费偏移量也是相同的，MQClientInstance启动时开启默认5S的定时任务进行同步消费偏移量`MQClientInstance.this.persistAllConsumerOffset()`**
+
+
+
+
+
+
+
+
+
+### 总结
+
+**DefaultLitePullConsumer运行流程与推送的消费者类似，只是部分方法内部实现不同**
+
+**再平衡机制会将队列负载均衡到消费者，同时更新队列对应的拉取任务**
+
+**拉取任务使用线程池执行，拉取前会检查状态以及流控失败就延迟重试，然后获取下次拉取消息的偏移量，接着同步向broker进行拉取消息**
+
+**如果拉取到消息，会将消息存储在队列对应的processQueue，并封装消费请求提交到ConsumerQueueCache中**
+
+**拉取与推送的一大区别是，拉取获取消息的逻辑需要自己来实现，更加自由易扩展，poll获取消息则是从ConsumerQueueCache中获取消费请求并拿到消息再进行处理**
+
+
+
+
+
+
+
 ## 末尾
+
