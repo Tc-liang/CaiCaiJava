@@ -5208,7 +5208,1149 @@ private void updatePullTask(String topic, Set<MessageQueue> mqNewSet) {
 
 
 
+## RocketMQ（九）：延迟消息是如何实现的？
 
+上个阶段已经从再平衡机制、拉取消息、并发/顺序消费消息来完全描述过消费者相关的消费原理
+
+其中在并发消费的文章中曾说过：**并发消费失败时会采用重试机制，将重试的消息作为延迟消息投入延迟队列，经历延迟时间后再重新放回重试队列，等待后续被消费者拉取然后再进行重试消费**
+
+其中，延迟消息（Delayed Message）不仅仅只用于重试，还是一个非常实用的功能，它允许消息在指定的时间后才被消费，这对于定时任务、订单超时提醒、促销活动等场景尤为重要
+
+当时并没有详细说明延时队列的原理，本篇文章通过图文并茂、通俗易懂的说明延迟消息是如何实现的
+
+阅读本篇文章之前需要了解[消息发送](https://juejin.cn/post/7412672656363798591)、[持久化](https://juejin.cn/post/7412922870521184256)相关的流程
+
+本文导图如下：
+
+![导图](https://bbs-img.huaweicloud.com/blogs/img/20241119/1731979252982926714.png)
+
+
+
+> 往期回顾：
+
+[RocketMQ（八）：轻量级拉取消费原理](https://juejin.cn/post/7436419198446387240)
+
+[RocketMQ（七）：消费者如何保证顺序消费？](https://juejin.cn/post/7435651780329734207)
+
+[RocketMQ（六）：Consumer Rebalanc原理（运行流程、触发时机、导致的问题）](https://juejin.cn/post/7433436835462791187)
+
+[RocketMQ（五）：揭秘高吞吐量并发消费原理](https://juejin.cn/post/7433066208825524243)
+
+[RocketMQ（四）：消费前如何拉取消息？（长轮询机制）](https://juejin.cn/post/7417635848987033615)
+
+[RocketMQ（三）：面对高并发请求，如何高效持久化消息？（核心存储文件、持久化核心原理、源码解析）](https://juejin.cn/post/7412922870521184256)
+
+[RocketMQ（二）：揭秘发送消息核心原理（源码与设计思想解析）](https://juejin.cn/post/7412672656363798591)
+
+[RocketMQ（一）：消息中间件缘起，一览整体架构及核心组件](https://juejin.cn/post/7411686792342732841)
+
+
+
+### 使用延迟消息
+
+使用延迟消息非常简单，只需要调用 `setDelayTimeLevel` 方法设置延迟的级别
+
+```java
+Message message = new Message(topic, tag, body);
+message.setDelayTimeLevel(delayLevel);
+```
+
+一共分为18个延迟级别可以设置：
+
+| 投递等级（delay level） | 延迟时间 | 投递等级（delay level） | 延迟时间 |
+| :---------------------: | :------: | :---------------------: | :------: |
+|            1            |    1s    |           10            |   6min   |
+|            2            |    5s    |           11            |   7min   |
+|            3            |   10s    |           12            |   8min   |
+|            4            |   30s    |           13            |   9min   |
+|            5            |   1min   |           14            |  10min   |
+|            6            |   2min   |           15            |  20min   |
+|            7            |   3min   |           16            |  30min   |
+|            8            |   4min   |           17            |    1h    |
+|            9            |   5min   |           18            |    2h    |
+
+设置完延时级别后，其他使用方式与普通消息相同，延时消息的机制是在Broker自动实现的，等待对应的延时时间后，消息就会被重新进行消费
+
+
+
+### 延迟消息原理
+
+接下来让我们分析下，延时消息是如何实现的
+
+
+
+#### 消息投入延时队列
+
+`setDelayTimeLevel` 方法会**在消息的properties中对延时级别进行存储**
+
+```java
+public static final String PROPERTY_DELAY_TIME_LEVEL = "DELAY";
+
+public void setDelayTimeLevel(int level) {
+    this.putProperty(MessageConst.PROPERTY_DELAY_TIME_LEVEL, String.valueOf(level));
+}
+```
+
+与普通消息发送消息流程相同，这里就不过多叙述，主要对延迟消息的处理在Broker对消息进行持久化时：
+
+在持久化消息的流程中，需要对CommitLog进行追加消息数据 `this.commitLog.asyncPutMessage(msg)`
+
+> CompletableFuture<PutMessageResult> putResultFuture = this.commitLog.asyncPutMessage(msg);
+
+在此方法中，**CommitLog追加数据前会判断消息是否为延迟消息，如果是则会将消息原有的topic、队列信息替换为延迟相关的，并将原数据存储到properties**
+
+```java
+if (msg.getDelayTimeLevel() > 0) {
+    if (msg.getDelayTimeLevel() > this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel()) {
+        msg.setDelayTimeLevel(this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel());
+    }
+
+    //topic改为延迟topic
+    topic = TopicValidator.RMQ_SYS_SCHEDULE_TOPIC;
+    //队列改为延迟队列
+    int queueId = ScheduleMessageService.delayLevel2QueueId(msg.getDelayTimeLevel());
+
+    // Backup real topic, queueId
+    //将原始topic、队列数据备份到properties
+    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_REAL_TOPIC, msg.getTopic());
+    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_REAL_QUEUE_ID, String.valueOf(msg.getQueueId()));
+    msg.setPropertiesString(MessageDecoder.messageProperties2String(msg.getProperties()));
+
+    //更新为延迟相关的topic、队列
+    msg.setTopic(topic);
+    msg.setQueueId(queueId);
+}
+```
+
+**延迟的topic固定为`SCHEDULE_TOPIC_XXXX`**，`ScheduleMessageService.delayLevel2QueueId`方法中则是对延迟级别进行减一，说明18个级别对应的队列ID为0-17
+
+```java
+public static int delayLevel2QueueId(final int delayLevel) {
+    return delayLevel - 1;
+}
+```
+
+至此消息就会被持久化到对应的延迟队列中，后续**延时队列中消息都要经过一定的延时时间才会被组件ScheduleMessageService重新取出投入到原数据的队列中**（延时时间与级别对应）
+
+
+
+
+
+#### ScheduleMessageService初始化
+
+**组件ScheduleMessageService用于处理延时消息，初始化的步骤：**
+
+1. **加载数据：加载每个延时队列对应的偏移量、解析延时级别对应延时时间、矫正延时偏移量**
+2. **初始化执行定时任务的线程池**
+3. **遍历延时队列并创建传递延时消息的任务放入线程池执行**（每个队列对应一个任务）
+4. **启动定时持久化的任务**
+
+![](https://bbs-img.huaweicloud.com/blogs/img/20240928/1727516243568788117.png)
+
+```java
+public void start() {
+    if (started.compareAndSet(false, true)) {
+        //加载数据
+        this.load();
+        
+        //初始化线程池
+        this.deliverExecutorService = new ScheduledThreadPoolExecutor(this.maxDelayLevel, new ThreadFactoryImpl("ScheduleMessageTimerThread_"));
+        if (this.enableAsyncDeliver) {
+            this.handleExecutorService = new ScheduledThreadPoolExecutor(this.maxDelayLevel, new ThreadFactoryImpl("ScheduleMessageExecutorHandleThread_"));
+        }
+        
+        //遍历延时队列（延时级别以及对应的延时时间），并创建任务放入线程池进行执行
+        for (Map.Entry<Integer, Long> entry : this.delayLevelTable.entrySet()) {
+            //延时级别
+            Integer level = entry.getKey();
+            //延时时间 ms
+            Long timeDelay = entry.getValue();
+            //延时偏移量
+            Long offset = this.offsetTable.get(level);
+            if (null == offset) {
+                offset = 0L;
+            }
+
+            //创建任务放入线程池执行
+            if (timeDelay != null) {
+                //异步的情况
+                if (this.enableAsyncDeliver) {
+                    this.handleExecutorService.schedule(new HandlePutResultTask(level), FIRST_DELAY_TIME, TimeUnit.MILLISECONDS);
+                }
+                //同步
+                this.deliverExecutorService.schedule(new DeliverDelayedMessageTimerTask(level, offset), FIRST_DELAY_TIME, TimeUnit.MILLISECONDS);
+            }
+        }
+
+        //开启持久化定时任务
+        this.deliverExecutorService.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (started.get()) {
+                        ScheduleMessageService.this.persist();
+                    }
+                } catch (Throwable e) {
+                    log.error("scheduleAtFixedRate flush exception", e);
+                }
+            }
+        }, 10000, this.defaultMessageStore.getMessageStoreConfig().getFlushDelayOffsetInterval(), TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+在加载数据的方法中，主要是**从文件中加载各个队列的偏移量、解析各个延时级别对应的延时时间以及矫正偏移量**
+
+（这里的偏移量其实就是延时队列的ConsumerQueue记录的偏移量，通过consumerQueue记录能够找到消息）
+
+> ScheduleMessageService.load
+
+```java
+public boolean load() {
+    //加载偏移量
+    boolean result = super.load();
+    //解析延时级别
+    result = result && this.parseDelayLevel();
+    //矫正偏移量
+    result = result && this.correctDelayOffset();
+    return result;
+}
+```
+
+调用`super.load()`时，会**从broker配置的存储目录下`config/delayOffset.json`文件，读取每个队列偏移量的JSON数据，最终将数据填充到`offsetTable`**
+
+(`this.offsetTable.putAll(delayOffsetSerializeWrapper.getOffsetTable())`)
+
+文件内容如下：
+
+```json
+{
+	"offsetTable":{1:1,2:2,3:12,4:12,5:14,6:15,7:149,8:1251,9:397,10:112,11:60,12:59,13:58,14:58,15:64,16:60,17:59,18:1129
+	}
+}
+```
+
+
+
+
+
+> ScheduleMessageService.parseDelayLevel
+
+**解析延时级别主要就是将各个延时级别对应的时间解析为毫秒，并将结果存储到`delayLevelTable`**
+
+```java
+public boolean parseDelayLevel() {
+    //时间单位转换
+    HashMap<String, Long> timeUnitTable = new HashMap<String, Long>();
+    timeUnitTable.put("s", 1000L);
+    timeUnitTable.put("m", 1000L * 60);
+    timeUnitTable.put("h", 1000L * 60 * 60);
+    timeUnitTable.put("d", 1000L * 60 * 60 * 24);
+
+    //默认写死的延时级别 "1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h"
+    String levelString = this.defaultMessageStore.getMessageStoreConfig().getMessageDelayLevel();
+    try {
+        String[] levelArray = levelString.split(" ");
+        for (int i = 0; i < levelArray.length; i++) {
+            String value = levelArray[i];
+            String ch = value.substring(value.length() - 1);
+            Long tu = timeUnitTable.get(ch);
+
+            int level = i + 1;
+            if (level > this.maxDelayLevel) {
+                this.maxDelayLevel = level;
+            }
+            long num = Long.parseLong(value.substring(0, value.length() - 1));
+            long delayTimeMillis = tu * num;
+            //转换为ms后 写入 delayLevelTable
+            this.delayLevelTable.put(level, delayTimeMillis);
+            if (this.enableAsyncDeliver) {
+                this.deliverPendingTable.put(level, new LinkedBlockingQueue<>());
+            }
+        }
+    } catch (Exception e) {
+        log.error("parseDelayLevel exception", e);
+        log.info("levelString String = {}", levelString);
+        return false;
+    }
+
+    return true;
+}
+```
+
+**`correctDelayOffset`矫正偏移量则是判断偏移量是否超过逻辑队列ConsumerQueue最小/大值，超出则设置为最小/大值**
+
+后续较为重要的流程就是遍历所有延时队列，创建DeliverDelayedMessageTimerTask任务交给线程池处理（默认同步情况下）
+
+
+
+
+
+#### 定时转发延时消息
+
+**DeliverDelayedMessageTimerTask任务用于定时转发延时消息，会判断当前队列的消息是否过期，如果过期会将消息重投到原topic、队列中，否则延时重试**
+
+执行过程中，会调用`executeOnTimeup`，流程如下：
+
+1. **获取延时队列对应的消费队列ConsumerQueue**（根据topic、队列id）
+2. **根据偏移量获取ConsumerQueue对应位置的映射缓冲**（方便后续读consumer queue记录）
+3. **遍历解析consumer queue记录，判断消息是否超时，超时则找到CommitLog上的消息，并恢复消息原始topic、队列，最后进行转发到对应队列，期间失败或其他情况延时重试**
+
+（需要理解[ConsumerQueue文件](https://juejin.cn/post/7412922870521184256#heading-3)）
+
+```java
+public void executeOnTimeup() {
+    //找到延时队列对应的（逻辑）消费队列 ConsumerQueue
+    ConsumeQueue cq =
+        ScheduleMessageService.this.defaultMessageStore.findConsumeQueue(TopicValidator.RMQ_SYS_SCHEDULE_TOPIC,
+            delayLevel2QueueId(delayLevel));
+
+    if (cq == null) {
+        //没找到消费队列就延时处理
+        this.scheduleNextTimerTask(this.offset, DELAY_FOR_A_WHILE);
+        return;
+    }
+
+    //根据偏移量获取对应的映射缓冲 方便后续读
+    SelectMappedBufferResult bufferCQ = cq.getIndexBuffer(this.offset);
+    if (bufferCQ == null) {
+        //没获取到 可能是偏移量有问题 纠正 延时执行
+        long resetOffset;
+        if ((resetOffset = cq.getMinOffsetInQueue()) > this.offset) {
+            log.error("schedule CQ offset invalid. offset={}, cqMinOffset={}, queueId={}",
+                this.offset, resetOffset, cq.getQueueId());
+        } else if ((resetOffset = cq.getMaxOffsetInQueue()) < this.offset) {
+            log.error("schedule CQ offset invalid. offset={}, cqMaxOffset={}, queueId={}",
+                this.offset, resetOffset, cq.getQueueId());
+        } else {
+            resetOffset = this.offset;
+        }
+
+        this.scheduleNextTimerTask(resetOffset, DELAY_FOR_A_WHILE);
+        return;
+    }
+
+    //获取到映射缓存的情况下
+    long nextOffset = this.offset;
+    try {
+        int i = 0;
+        ConsumeQueueExt.CqExtUnit cqExtUnit = new ConsumeQueueExt.CqExtUnit();
+        //遍历consumer queue记录 
+        for (; i < bufferCQ.getSize() && isStarted(); i += ConsumeQueue.CQ_STORE_UNIT_SIZE) {
+            //读取数据 消息偏移量、大小、tag哈希值（延时消息该字段被利用延时后的时间）
+            long offsetPy = bufferCQ.getByteBuffer().getLong();
+            int sizePy = bufferCQ.getByteBuffer().getInt();
+            long tagsCode = bufferCQ.getByteBuffer().getLong();
+
+            //...
+			
+            long now = System.currentTimeMillis();
+            //超过延迟到达时间就是延迟到达时间，否则就是now 会被延时处理
+            long deliverTimestamp = this.correctDeliverTimestamp(now, tagsCode);
+            //下个偏移量
+            nextOffset = offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
+			
+            //时间未到的情况下延时处理
+            long countdown = deliverTimestamp - now;
+            if (countdown > 0) {
+                this.scheduleNextTimerTask(nextOffset, DELAY_FOR_A_WHILE);
+                return;
+            }
+
+            //根据consumerqueue记录解析的偏移量和大小找到commit log上的消息
+            MessageExt msgExt = ScheduleMessageService.this.defaultMessageStore.lookMessageByOffset(offsetPy, sizePy);
+            if (msgExt == null) {
+                continue;
+            }
+
+            //将延时消息延时相关属性清理，使用原来的topic、队列数据
+            MessageExtBrokerInner msgInner = ScheduleMessageService.this.messageTimeup(msgExt);
+            if (TopicValidator.RMQ_SYS_TRANS_HALF_TOPIC.equals(msgInner.getTopic())) {
+                log.error("[BUG] the real topic of schedule msg is {}, discard the msg. msg={}",
+                    msgInner.getTopic(), msgInner);
+                continue;
+            }
+
+            //转发消息 默认同步
+            boolean deliverSuc;
+            if (ScheduleMessageService.this.enableAsyncDeliver) {
+                deliverSuc = this.asyncDeliver(msgInner, msgExt.getMsgId(), nextOffset, offsetPy, sizePy);
+            } else {
+                deliverSuc = this.syncDeliver(msgInner, msgExt.getMsgId(), nextOffset, offsetPy, sizePy);
+            }
+
+            //失败延迟重试
+            if (!deliverSuc) {
+                this.scheduleNextTimerTask(nextOffset, DELAY_FOR_A_WHILE);
+                return;
+            }
+        }
+
+        
+        nextOffset = this.offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
+    } catch (Exception e) {
+        log.error("ScheduleMessageService, messageTimeup execute error, offset = {}", nextOffset, e);
+    } finally {
+        bufferCQ.release();
+    }
+
+    this.scheduleNextTimerTask(nextOffset, DELAY_FOR_A_WHILE);
+}
+```
+
+**由于每条延时队列上需要延时的时间相同，并且消息入队的顺序为FIFO，因此判断超时只需要依次取出判断即可**
+
+**无论是同步转发还是异步转发，最终会调用`deliverMessage`重新持久化消息`ScheduleMessageService.this.writeMessageStore.asyncPutMessage(msgInner)`**
+
+至此延时消息的原理描述完毕，流程图如下：
+
+![](https://bbs-img.huaweicloud.com/blogs/img/20240928/1727516248579103329.png)
+
+
+
+
+
+### 总结
+
+**使用延时消息只需要通过API设置延时级别，不同的延时级别对应不同的延时时间**
+
+**broker将消息追加到commit log前会判断消息是否有设置延时级别，如果设置则说明为延时消息，会将原始topic、队列ID等数据存储在properties，并将消息topic、队列ID改为延时队列相关属性，最终消息会被持久化到延时队列**
+
+**每个延时队列都有定时任务隔100ms进行检测，如果消息超时则通过consumer queue记录找到commitlog中的消息，并将其原始topic、队列ID等信息恢复，再调用持久化消息的API，相当于将消息重投到最开始设置的队列中**
+
+**由于每个延时队列延时的时间相同，消息入队后，检测超时可以顺序检测，离超时时间越近的消息越前，如果有大量消息同时定时相同时间，处理流程可能会导致堆积从而影响定时精度**
+
+
+
+#### 最后（点赞、收藏、关注求求啦\~）
+
+我是菜菜，热爱技术交流、分享与写作，喜欢图文并茂、通俗易懂的输出知识
+
+本篇文章被收入专栏 [消息中间件](https://juejin.cn/column/7405771885327892532)，感兴趣的同学可以持续关注喔
+
+本篇文章笔记以及案例被收入 [Gitee-CaiCaiJava](https://gitee.com/tcl192243051/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)、 [Github-CaiCaiJava](https://github.com/Tc-liang/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)，除此之外还有更多Java进阶相关知识，感兴趣的同学可以starred持续关注喔\~
+
+有什么问题可以在评论区交流，如果觉得菜菜写的不错，可以点赞、关注、收藏支持一下\~
+
+关注菜菜，分享更多技术干货，公众号：菜菜的后端私房菜
+
+
+
+
+
+## RocketMQ（十）：如何保证消息严格有序？
+
+在某些业务场景中，MQ需要保证消息的顺序性，比如支付订单应该在创建订单之后进行
+
+如果不使用保证顺序的手段，由于多队列、网络等因素可能会导致先处理支付订单的消息再处理创建订单的消息，这样就会导致处理失败
+
+为了避免这样的情况发生，使用MQ时有必要保证消息的顺序性，在RocketMQ中通常**使用顺序发送消息和顺序消费消息来保证消息的顺序性**
+
+本篇文章就来描述RocketMQ下如何确保可靠的消息顺序性，思维导图如下：
+
+![](https://bbs-img.huaweicloud.com/blogs/img/20241010/1728548046376604323.png)
+
+> 往期回顾：
+
+[RocketMQ（九）：延迟消息是如何实现的？](https://juejin.cn/post/7438640461818708022)
+
+[RocketMQ（八）：轻量级拉取消费原理](https://juejin.cn/post/7436419198446387240)
+
+[RocketMQ（七）：消费者如何保证顺序消费？](https://juejin.cn/post/7435651780329734207)
+
+[RocketMQ（六）：Consumer Rebalanc原理（运行流程、触发时机、导致的问题）](https://juejin.cn/post/7433436835462791187)
+
+[RocketMQ（五）：揭秘高吞吐量并发消费原理](https://juejin.cn/post/7433066208825524243)
+
+[RocketMQ（四）：消费前如何拉取消息？（长轮询机制）](https://juejin.cn/post/7417635848987033615)
+
+[RocketMQ（三）：面对高并发请求，如何高效持久化消息？（核心存储文件、持久化核心原理、源码解析）](https://juejin.cn/post/7412922870521184256)
+
+[RocketMQ（二）：揭秘发送消息核心原理（源码与设计思想解析）](https://juejin.cn/post/7412672656363798591)
+
+[RocketMQ（一）：消息中间件缘起，一览整体架构及核心组件](https://juejin.cn/post/7411686792342732841)
+
+
+
+### 顺序发送
+
+当队列全局只有一个时，消息全局有序，此时只需要确保为单个生产者发送（多个生产者同时发送无法预估消息到达的顺序）
+
+或者先生产创建订单的消息再生产支付订单的消息（确保消息不丢）由于全局有序只能有一个队列，队列的压力过大，所以不经常使用
+
+更通用的做法是使用**队列有序：在发送消息时通过一定的路由算法将需要有序的消息分发到同一个队列中，使用相同的队列保证有序性**
+
+![](https://bbs-img.huaweicloud.com/blogs/img/20241009/1728464292095309613.png)
+
+**当使用队列有序时也需要确保由一个生产者进行串行发送**（先创建订单再支付这种情况下多生产者也是可以的，因为创建/支付订单虽然生产者可能不同，但能确保消息到达的情况下，消息也是有序的，满足因果一致性）
+
+在RocketMQ中提供顺序消息的API，与发送其他消息的方法类似，只是参数增加队列选择器MessageQueueSelector和分片键（通常是业务唯一ID）
+
+```java
+public void sendOrderMsg(String topic, String msg, SelectMessageQueueByHash selectMessageQueue, String orderId) {
+    Message message = new Message(topic, msg.getBytes());
+    message.setBuyerId(orderId);
+    try {
+        producer.send(message, selectMessageQueue, orderId);
+    } catch (MQClientException | RemotingException | InterruptedException | MQBrokerException e) {
+        throw new RuntimeException(e);
+    }
+}
+```
+
+通常可以选择**使用SelectMessageQueueByHash，通过对业务唯一ID进行哈希来分配队列，以此来达到消息的队列有序**
+
+在之前的分析[发送消息](https://juejin.cn/post/7412672656363798591)的文章中曾说过发送消息通用流程，顺序消息调用的API虽然与普通消息通用的API不同（调用 `sendSelectImpl` ）
+
+但流程类似：**获取topic、队列数据，根据队列选择器选择队列，期间检测超时，最终调用核心方法 `sendKernelImpl` 进行发送消息**
+
+```java
+private SendResult sendSelectImpl(
+    Message msg,
+    MessageQueueSelector selector,
+    Object arg,
+    final CommunicationMode communicationMode,
+    final SendCallback sendCallback, final long timeout
+) throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
+    long beginStartTime = System.currentTimeMillis();
+    this.makeSureStateOK();
+    //参数校验
+    Validators.checkMessage(msg, this.defaultMQProducer);
+
+    //获取topic
+    TopicPublishInfo topicPublishInfo = this.tryToFindTopicPublishInfo(msg.getTopic());
+    if (topicPublishInfo != null && topicPublishInfo.ok()) {
+        MessageQueue mq = null;
+        try {
+            //获取队列
+            List<MessageQueue> messageQueueList =
+             mQClientFactory.getMQAdminImpl().parsePublishMessageQueues(topicPublishInfo.getMessageQueueList());
+            Message userMessage = MessageAccessor.cloneMessage(msg);
+            String userTopic = NamespaceUtil.withoutNamespace(userMessage.getTopic(), mQClientFactory.getClientConfig().getNamespace());
+            userMessage.setTopic(userTopic);
+
+            //选择队列
+            mq = mQClientFactory.getClientConfig().queueWithNamespace(selector.select(messageQueueList, userMessage, arg));
+        } catch (Throwable e) {
+            throw new MQClientException("select message queue threw exception.", e);
+        }
+
+        //超时判断
+        long costTime = System.currentTimeMillis() - beginStartTime;
+        if (timeout < costTime) {
+            throw new RemotingTooMuchRequestException("sendSelectImpl call timeout");
+        }
+        if (mq != null) {
+            //发送消息
+            return this.sendKernelImpl(msg, mq, communicationMode, sendCallback, null, timeout - costTime);
+        } else {
+            throw new MQClientException("select message queue return null.", null);
+        }
+    }
+
+    //失败 
+    validateNameServerSetting();
+    throw new MQClientException("No route info for this topic, " + msg.getTopic(), null);
+}
+```
+
+**顺序发送API可以看成没有重试机制、可自定义选择队列的同步发送消息版本**
+
+SelectMessageQueueByHash的实现也比较简单，就是根据唯一ID哈希模上队列
+
+```java
+public class SelectMessageQueueByHash implements MessageQueueSelector {
+
+    @Override
+    public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {
+        int value = arg.hashCode() % mqs.size();
+        if (value < 0) {
+            value = Math.abs(value);
+        }
+        return mqs.get(value);
+    }
+}
+```
+
+总的来说**如果要保证顺序发送消息，可以通过业务唯一ID与分片算法将消息放到相同队列，避免并发发送消息**（无法预估到达队列顺序）
+
+
+
+
+
+### 顺序消费
+
+前文说过消费者消息消息时，为了全力以赴通常都是使用线程池进行并发消费的
+
+当一批顺序消息被同时拉取到消费者时，如果由线程池并发进行消费也会导致消息的顺序性失效
+
+因此在消费端也需要进行顺序消费，使用DefaultMQPushConsumer进行消费时，设置消息监听器为MessageListenerOrderly
+
+在顺序消费的文章中也说过：**设置消息监听器为MessageListenerOrderly时，会通过多种加锁的方式保证消费者顺序消费队列中的消息**
+
+但**如果消费发生失败会阻塞队列导致消息堆积**，因此需要注意特殊处理，比如重试次数超过阈值时就记录下来后续再处理
+
+```java
+consumer.registerMessageListener((MessageListenerOrderly) (msgs, context) -> {
+    try {
+        for (MessageExt msg : msgs) {
+            // 获取消息的重试次数
+            int retryCount = msg.getReconsumeTimes();
+            System.out.println("Message [" + msg.getMsgId() + "] is reconsumed " + retryCount + " times");
+
+            //如果重试次数超过阈值 记录
+            if (retryCount >= 3) {
+                System.out.println("Message [" + msg.getMsgId() + "] add DB");
+            }
+
+            // 模拟消费失败
+            if (retryCount < 3) {
+                throw new RuntimeException("Consume failed");
+            }
+
+            // 消费成功
+            System.out.println("Message [" + msg.getMsgId() + "] consumed successfully");
+        }
+        return ConsumeOrderlyStatus.SUCCESS;
+    } catch (Exception e) {
+        // 记录日志
+        e.printStackTrace();
+        // 返回重试状态
+        return ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT;
+    }
+});
+```
+
+总的来说：**使用MessageListenerOrderly保证顺序消费时需要在失败重试时进行特殊处理，如果一直失败会阻塞队列导致消息堆积**
+
+
+
+
+
+
+
+### 一致性
+
+在架构篇中层说过，每个Master Broker都可能负责Topic下不同队列（如图中TopicA的4个队列分布在Broker A和B）
+
+![](https://bbs-img.huaweicloud.com/blogs/img/20241010/1728543629904199034.png)
+
+**当Broker发生宕机时队列数量会发生改变，可能会导致分片算法将同一ID的消息分发到不同队列从而导致极端情况影响消息的顺序性**
+
+**如果队列数量不改变则投递到宕机中Broker的消息自然会失败，从而影响系统的可用性**
+
+类似于CAP理论，当发生宕机（分区容错 Partition Tolerance）时，要么保证可用性（Availability），要么保证一致性（Consistency）
+
+**如果要确保强一致性，需要将Topic中消息类型设置为FIFO，并开启NameServer中的配置 `orderMessageEnable` 和 `returnOrderTopicConfigToBroker` 为true**
+
+![](https://bbs-img.huaweicloud.com/blogs/img/20241010/1728543216112704667.png)
+
+**如果即要满足可用性、又要能支持队列数量的水平扩容，还需要确保消息严格顺序：**
+
+1. **在分片算法上选择满足单调性(在队列数量动态发生变化时，已分配的key只会被分片到原队列或新队列)的算法**（一致性哈希）
+
+2. **先进行扩容队列 -> 再消费旧队列中遗留的消息 -> 最后再开始消费所有队列，以此来保证消息的严格顺序**（因为单调性分片算法还是可能会导致key被分片到其他队列，为了保证严格有序，要将旧队列中遗留消息优先消费，再消费新队列）
+
+**单调性：**（比如有A、B、C三个旧队列，key被分片到B队列，新增三个D、E、F队列，key只能被分配到B或D或E或F队列，而不会被分配到A或C队列中）
+
+
+
+
+
+### 总结
+
+**在需要保证消息有序的业务场景下，RocketMQ由顺序发送和顺序消费来保证消息顺序性**
+
+**顺序发送通常使用队列有序来保证，将唯一的业务ID根据分片算法分发到对应的队列中，要注意避免并发发送，以免无法预估消息到达队列的先后顺序**
+
+**顺序消费通常使用MessageListenerOrderly消息监听器，它通过加锁的方式顺序消费队列消息，保证消息有序消费但会降低消费吞吐量，并且失败会一直重试，可能导致消息堆积，需要特殊处理失败的情况**
+
+**当Broker发生宕机时会导致队列数量发生改变，极端情况下会影响消息的顺序性，如果要保证强一致性需要设置Topic的消息类型为FIFO并开启NameServer中的配置 `orderMessageEnable` 和 `returnOrderTopicConfigToBroker` 为true**
+
+**如果即要满足可用性、又要能支持队列数量的水平扩容，还需要确保消息严格顺序，可以在分片算法上选择满足单调性(在队列数量动态发生变化时，已分配的key只会被分片到原队列或新队列)的算法，并进行先扩容队列 -> 再消费旧队列中遗留的消息 -> 最后再开始消费所有队列，以此来保证消息的严格顺序**
+
+
+
+#### 最后（点赞、收藏、关注求求啦\~）
+
+我是菜菜，热爱技术交流、分享与写作，喜欢图文并茂、通俗易懂的输出知识
+
+本篇文章被收入专栏 [消息中间件](https://juejin.cn/column/7405771885327892532)，感兴趣的同学可以持续关注喔
+
+本篇文章笔记以及案例被收入 [Gitee-CaiCaiJava](https://gitee.com/tcl192243051/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)、 [Github-CaiCaiJava](https://github.com/Tc-liang/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)，除此之外还有更多Java进阶相关知识，感兴趣的同学可以starred持续关注喔\~
+
+有什么问题可以在评论区交流，如果觉得菜菜写的不错，可以点赞、关注、收藏支持一下\~
+
+关注菜菜，分享更多技术干货，公众号：菜菜的后端私房菜
+
+
+
+
+
+
+
+## RocketMQ（十一）：事务消息如何满足分布式一致性？
+
+### 前言
+
+在分布式系统中由于相关联的多个服务所在的数据库互相隔离，数据库无法使用本地事务来保证数据的一致性，因此需要使用分布式事务来保证数据的一致性
+
+比如用户支付订单后，需要更改订单状态，还需要涉及其他服务的其他操作如：物流出货、积分变更、清空购物车等
+
+由于它们数据所存储的数据库会互相隔离，当订单状态修改成功/失败时，其他服务对应的数据也需要修改成功/失败，否则就会出现数据不一致的情况
+
+解决分布式事务常用的一种方案是使用MQ做补偿以此来达到数据的最终一致性，而**RocketMQ提供的事务消息能够简单、有效的解决分布式事务满足数据最终一致性**
+
+在上面支付订单的案例中，主分支只需要修改订单状态，其他分支（出货、积分变更、清空购物车）都可以发送事务消息来达到数据最终一致性
+
+![image.png](https://bbs-img.huaweicloud.com/blogs/img/20241011/1728627625702740501.png)
+
+本篇文章通过分析源码来描述事务消息的原理以及使用方法，并总结使用时需要注意的地方，思维导图如下：
+
+![本文导图](https://bbs-img.huaweicloud.com/blogs/img/20241217/1734407771495895452.png)
+
+> 往期回顾：
+
+[RocketMQ（十）：如何保证消息严格有序？](https://juejin.cn/post/7440842636230131764)
+
+[RocketMQ（九）：延迟消息是如何实现的？](https://juejin.cn/post/7438640461818708022)
+
+[RocketMQ（八）：轻量级拉取消费原理](https://juejin.cn/post/7436419198446387240)
+
+[RocketMQ（七）：消费者如何保证顺序消费？](https://juejin.cn/post/7435651780329734207)
+
+[RocketMQ（六）：Consumer Rebalanc原理（运行流程、触发时机、导致的问题）](https://juejin.cn/post/7433436835462791187)
+
+[RocketMQ（五）：揭秘高吞吐量并发消费原理](https://juejin.cn/post/7433066208825524243)
+
+[RocketMQ（四）：消费前如何拉取消息？（长轮询机制）](https://juejin.cn/post/7417635848987033615)
+
+[RocketMQ（三）：面对高并发请求，如何高效持久化消息？（核心存储文件、持久化核心原理、源码解析）](https://juejin.cn/post/7412922870521184256)
+
+[RocketMQ（二）：揭秘发送消息核心原理（源码与设计思想解析）](https://juejin.cn/post/7412672656363798591)
+
+[RocketMQ（一）：消息中间件缘起，一览整体架构及核心组件](https://juejin.cn/post/7411686792342732841)
+
+
+
+
+
+### 使用事务消息
+
+事务消息拥有“半事务”的状态，在这种状态下即时消息到达broker也不能进行消费，直到主分支本地事务提交，事务消息才能被下游服务进行消费
+
+使用事务消息的流程如下：
+
+1. **生产者发送半事务消息**（消息到达broker后处于半事务状态，下游服务暂时无法消费）
+2. **生产者执行本地事务**，无论本地事务成功(commit)还是失败(rollback)都要通知broker，如果成功则事务消息允许被消费，如果失败则丢弃事务消息
+3. 在步骤2中，由于网络等缘故broker可能未接收到本地事务执行的结果，**当broker等待一定时间未收到状态时会自动回查状态**
+
+![image.png](https://bbs-img.huaweicloud.com/blogs/img/20241011/1728629365039187765.png)
+
+发送事务消息的生产者为TransactionMQProducer，TransactionMQProducer的使用与默认类似，只不过需要设置事务监听器TransactionListener
+
+**事务监听器接口需要实现executeLocalTransaction用于执行本地事务和checkLocalTransaction用于broker回查本地事务状态**
+
+```java
+public interface TransactionListener {
+    //执行本地事务
+    LocalTransactionState executeLocalTransaction(final Message msg, final Object arg);
+    //回查事务状态
+    LocalTransactionState checkLocalTransaction(final MessageExt msg);
+}
+```
+
+它们的结果LocalTransactionState有三个状态：COMMIT_MESSAGE 成功、ROLLBACK_MESSAGE 失败、UNKNOW 未知
+
+当为未知状态时，后续还会触发回查，直到超过次数或者返回成功/失败
+
+**调用 `sendMessageInTransaction` 发送事务消息，其中参数arg用于扩展，执行本地事务时会携带使用**
+
+```java
+public TransactionSendResult sendMessageInTransaction(final Message msg,final Object arg)
+```
+
+根据我们的情况写出TransactionListener的模拟代码
+
+```java
+public class OrderPayTransactionListener implements TransactionListener {
+    //执行本地事务 其中参数arg传递的为订单ID
+    @Override
+    public LocalTransactionState executeLocalTransaction(Message msg, Object orderId) {
+        try {
+            //修改订单状态为已支付
+            if (updatePayStatus((Long) orderId)) {
+                return LocalTransactionState.COMMIT_MESSAGE;
+            }
+        } catch (Exception e) {
+            //log
+            return LocalTransactionState.UNKNOW;
+        }
+        return LocalTransactionState.ROLLBACK_MESSAGE;
+    }
+
+
+    //回查状态
+    @Override
+    public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        Long orderId = Long.valueOf(msg.getBuyerId());
+        //查询订单状态是否为已支付
+        try {
+            if (isPayed(orderId)) {
+                return LocalTransactionState.COMMIT_MESSAGE;
+            }
+        } catch (Exception e) {
+            //log
+            return LocalTransactionState.UNKNOW;
+        }
+
+        return LocalTransactionState.ROLLBACK_MESSAGE;
+    }
+}
+```
+
+执行本地事务时如果成功修改订单状态就返回commit，回查状态时判断订单状态是否为已支付
+
+
+
+
+
+### 事务消息原理
+
+
+
+#### 发送事务消息
+
+[前文](https://juejin.cn/post/7412672656363798591)分析过通用的发送消息流程，而 `sendMessageInTransaction` 发送消息调用通用的发送消息流程外，还会在期间多做一些处理：
+
+1. **准备**（检查事务监听器、消息、清理延迟级别、标记事务消息为半事务状态、存储数据）
+2. **通用同步发送消息流程 `sendDefaultImpl` **（校验参数、获取路由信息、选择队列、封装消息、netty rpc调用，期间检查超时、超时情况）
+3. **获取发送消息结果，如果成功使用事务监听器执行本地事务 `executeLocalTransaction` **
+4. **根据本地事务状态单向通知broker `endTransactionOneway` **（有回查机制无需考虑失败）
+
+```java
+public TransactionSendResult sendMessageInTransaction(final Message msg,
+    final LocalTransactionExecuter localTransactionExecuter, final Object arg)
+    throws MQClientException {
+    //检查事务监听器
+    TransactionListener transactionListener = getCheckListener();
+    if (null == localTransactionExecuter && null == transactionListener) {
+        throw new MQClientException("tranExecutor is null", null);
+    }
+    //清除延迟等级 使用事务消息就不能使用延迟消息
+    // ignore DelayTimeLevel parameter
+    if (msg.getDelayTimeLevel() != 0) {
+        MessageAccessor.clearProperty(msg, MessageConst.PROPERTY_DELAY_TIME_LEVEL);
+    }
+    //检查消息
+    Validators.checkMessage(msg, this.defaultMQProducer);
+    SendResult sendResult = null;
+    //标记事务消息为半事务状态
+    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_TRANSACTION_PREPARED, "true");
+    //存储生产者组
+    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_PRODUCER_GROUP, this.defaultMQProducer.getProducerGroup());
+    try {
+        //通用的发送消息流程
+        sendResult = this.send(msg);
+    } catch (Exception e) {
+        throw new MQClientException("send message Exception", e);
+    }
+    
+    LocalTransactionState localTransactionState = LocalTransactionState.UNKNOW;
+    Throwable localException = null;
+    switch (sendResult.getSendStatus()) {
+        case SEND_OK: {
+            try {
+                if (sendResult.getTransactionId() != null) {
+                    msg.putUserProperty("__transactionId__", sendResult.getTransactionId());
+                }
+                String transactionId = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+                if (null != transactionId && !"".equals(transactionId)) {
+                    msg.setTransactionId(transactionId);
+                }
+                if (null != localTransactionExecuter) {
+                    localTransactionState = localTransactionExecuter.executeLocalTransactionBranch(msg, arg);
+                } else if (transactionListener != null) {
+                    log.debug("Used new transaction API");
+                    //成功执行本地事务
+                    localTransactionState = transactionListener.executeLocalTransaction(msg, arg);
+                }
+                if (null == localTransactionState) {
+                    localTransactionState = LocalTransactionState.UNKNOW;
+                }
+
+                if (localTransactionState != LocalTransactionState.COMMIT_MESSAGE) {
+                    log.info("executeLocalTransactionBranch return {}", localTransactionState);
+                    log.info(msg.toString());
+                }
+            } catch (Throwable e) {
+                log.info("executeLocalTransactionBranch exception", e);
+                log.info(msg.toString());
+                localException = e;
+            }
+        }
+        break;
+        case FLUSH_DISK_TIMEOUT:
+        case FLUSH_SLAVE_TIMEOUT:
+        case SLAVE_NOT_AVAILABLE:
+            //刷盘超时 或 从节点不可用 相当于失败
+            localTransactionState = LocalTransactionState.ROLLBACK_MESSAGE;
+            break;
+        default:
+            break;
+    }
+    
+    try {
+        //通知broker本地事务状态
+        this.endTransaction(msg, sendResult, localTransactionState, localException);
+    } catch (Exception e) {
+        log.warn("local transaction execute " + localTransactionState + ", but end broker transaction failed", e);
+    }
+    
+    //返回
+    TransactionSendResult transactionSendResult = new TransactionSendResult();
+    transactionSendResult.setSendStatus(sendResult.getSendStatus());
+    transactionSendResult.setMessageQueue(sendResult.getMessageQueue());
+    transactionSendResult.setMsgId(sendResult.getMsgId());
+    transactionSendResult.setQueueOffset(sendResult.getQueueOffset());
+    transactionSendResult.setTransactionId(sendResult.getTransactionId());
+    transactionSendResult.setLocalTransactionState(localTransactionState);
+    return transactionSendResult;
+}
+```
+
+在发送的流程中主要会**在发送前做一些准备如标记半事务状态，然后进行同步发送，如果发送成功则会执行本地事务，最后单向通知broker本地事务的状态**
+
+![image.png](https://bbs-img.huaweicloud.com/blogs/img/20241014/1728876242887122584.png)
+
+
+
+
+
+
+
+#### broker存储事务消息
+
+之前的文章也说过[消息到达后，broker存储消息的原理](https://juejin.cn/post/7412922870521184256)（先写CommitLog、再写其他文件）
+
+**事务消息在消息进行存储前，会使用桥接器TransactionalMessageBridge调用 `parseHalfMessageInner` ，将消息topic改为半事务topic并存储原始topic、队列ID**（方便后续重新投入真正的topic）
+
+```java
+private MessageExtBrokerInner parseHalfMessageInner(MessageExtBrokerInner msgInner) {
+    //存储真正的topic和队列ID
+    MessageAccessor.putProperty(msgInner, MessageConst.PROPERTY_REAL_TOPIC, msgInner.getTopic());
+    MessageAccessor.putProperty(msgInner, MessageConst.PROPERTY_REAL_QUEUE_ID,
+        String.valueOf(msgInner.getQueueId()));
+    msgInner.setSysFlag(
+        MessageSysFlag.resetTransactionValue(msgInner.getSysFlag(), MessageSysFlag.TRANSACTION_NOT_TYPE));
+    //设置本次要投入的topic为半事务Topic RMQ_SYS_TRANS_HALF_TOPIC
+    msgInner.setTopic(TransactionalMessageUtil.buildHalfTopic());
+    msgInner.setQueueId(0);
+    msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgInner.getProperties()));
+    return msgInner;
+}
+```
+
+这样**半事务状态的事务消息就会被投入半事务topic的队列中，这样就能达到消费者无法消费半事务消息**（因为它们没被投入真实的队列中）
+
+![image.png](https://bbs-img.huaweicloud.com/blogs/img/20241014/1728876791041470986.png)
+
+
+
+
+
+#### broker接收本地事务状态通知
+
+生产者发送完消息，无论成功还是失败都会通知broker本地事务状态
+
+broker**使用EndTransactionProcessor处理`END_TRANSACTION`的请求**，其核心逻辑就是根据本地事务状态进行处理：
+
+1. **如果成功根据CommitLog偏移量找到半事务消息，将其重投到真实的topic、队列中，最后再删除**
+2. **如果失败根据CommitLog偏移量找到半事务消息进行删除**
+
+```java
+public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand request) throws
+    RemotingCommandException {
+    //构建通用响应
+    final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+    //解析
+    final EndTransactionRequestHeader requestHeader =
+        (EndTransactionRequestHeader) request.decodeCommandCustomHeader(EndTransactionRequestHeader.class);
+
+    //从节点直接响应失败
+    if (BrokerRole.SLAVE == brokerController.getMessageStoreConfig().getBrokerRole()) {
+        response.setCode(ResponseCode.SLAVE_NOT_AVAILABLE);
+        return response;
+    }
+
+    
+    //...
+    
+    
+    OperationResult result = new OperationResult();
+    //成功的情况
+    if (MessageSysFlag.TRANSACTION_COMMIT_TYPE == requestHeader.getCommitOrRollback()) {
+        //调用 getHalfMessageByOffset 根据commitLog偏移量获取半事务消息
+        result = this.brokerController.getTransactionalMessageService().commitMessage(requestHeader);
+        //找到半事务消息
+        if (result.getResponseCode() == ResponseCode.SUCCESS) {
+            //检查数据
+            RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
+            if (res.getCode() == ResponseCode.SUCCESS) {
+                //检查成功 
+                MessageExtBrokerInner msgInner = endMessageTransaction(result.getPrepareMessage());
+                msgInner.setSysFlag(MessageSysFlag.resetTransactionValue(msgInner.getSysFlag(), requestHeader.getCommitOrRollback()));
+                msgInner.setQueueOffset(requestHeader.getTranStateTableOffset());
+                msgInner.setPreparedTransactionOffset(requestHeader.getCommitLogOffset());
+                msgInner.setStoreTimestamp(result.getPrepareMessage().getStoreTimestamp());
+                //清理半事务标识
+                MessageAccessor.clearProperty(msgInner, MessageConst.PROPERTY_TRANSACTION_PREPARED);
+                //重新将消息投入真实topic、队列中
+                RemotingCommand sendResult = sendFinalMessage(msgInner);
+                if (sendResult.getCode() == ResponseCode.SUCCESS) {
+                    //重投成功 删除事务消息
+                    this.brokerController.getTransactionalMessageService().deletePrepareMessage(result.getPrepareMessage());
+                }
+                return sendResult;
+            }
+            return res;
+        }
+    } else if (MessageSysFlag.TRANSACTION_ROLLBACK_TYPE == requestHeader.getCommitOrRollback()) {
+        //失败情况 也是调用 getHalfMessageByOffset 根据commitLog偏移量获取半事务消息
+        result = this.brokerController.getTransactionalMessageService().rollbackMessage(requestHeader);
+        if (result.getResponseCode() == ResponseCode.SUCCESS) {
+            RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
+            if (res.getCode() == ResponseCode.SUCCESS) {
+                //找到消息检查完就删除事务消息
+                this.brokerController.getTransactionalMessageService().deletePrepareMessage(result.getPrepareMessage());
+            }
+            return res;
+        }
+    }
+    response.setCode(result.getResponseCode());
+    response.setRemark(result.getResponseRemark());
+    return response;
+}
+```
+
+**成功或失败（commit/rollback）的情况都会删除半消息，成功的情况会将消息投入原始队列中，后续进行消费**
+
+![image.png](https://bbs-img.huaweicloud.com/blogs/img/20241014/1728877755529870983.png)
+
+而还要一种无法确定是成功还是失败的情况，需要broker进行回查
+
+
+
+
+
+#### broker回查机制
+
+负责回查的组件是**TransactionalMessageCheckService：定期对半事务消息进行检查是否需要回查**（在broker启动初始化时进行初始化）
+
+其检查回查会调用`this.brokerController.getTransactionalMessageService().check`
+
+它会**遍历事务topic `RMQ_SYS_TRANS_HALF_TOPIC` 下的所有队列，循环取出半事务消息进行判断是否需要进行回查**
+
+由于代码较多，这里总结性贴出关键代码：
+
+1. **根据队列、偏移量取出半事务消息 `getHalfMsg`**
+2. **超过检查次数（15）或最大存储时间（72h）就丢弃半事务消息 `resolveDiscardMsg`**
+3. **将消息重投入半消息topic（避免消息丢失）`putBackHalfMsgQueue`**
+4. **向生产者发送回查请求（请求码为CHECK_TRANSACTION_STATE）`resolveHalfMsg`**
+
+```java
+public void check(long transactionTimeout, int transactionCheckMax,AbstractTransactionalMessageCheckListener listener) {
+    //遍历事务topic下的所有队列，循环取出半事务消息进行判断是否需要进行回查
+    String topic = TopicValidator.RMQ_SYS_TRANS_HALF_TOPIC;
+	Set<MessageQueue> msgQueues = transactionalMessageBridge.fetchMessageQueues(topic);
+    for (MessageQueue messageQueue : msgQueues) {
+        while (true) {
+            //超出边界会退出 代码略
+            
+            //获取半事务消息 这里的参数i是半事务消息偏移量
+            GetResult getResult = getHalfMsg(messageQueue, i);
+           	MessageExt msgExt = getResult.getMsg();
+            
+            //needDiscard 超过最大检查次数 15次
+            //needSkip  超过最大存储时间 72h
+            if (needDiscard(msgExt, transactionCheckMax) || needSkip(msgExt)) {
+                //丢弃半事务消息
+                listener.resolveDiscardMsg(msgExt);
+                //..
+                continue;
+            }
+            
+            //...
+            
+            //超过6s
+            if (isNeedCheck) {
+                //将消息重投入半消息队列
+            	if (!putBackHalfMsgQueue(msgExt, i)) {
+                	continue;
+            	}
+            	//向生产者发送回查的请求 CHECK_TRANSACTION_STATE
+            	listener.resolveHalfMsg(msgExt);
+            }
+            
+        }
+    }
+}
+```
+
+**请求回查并不会返回结果，生产者处理查询到事务状态后，再向broker发送单向的本地事务状态通知请求**（endTransactionOneway）
+
+![image.png](https://bbs-img.huaweicloud.com/blogs/img/20241014/1728883719582293809.png)
+
+
+
+
+
+#### 生产者处理回查请求
+
+ClientRemotingProcessor 处理broker发送的回查请求CHECK_TRANSACTION_STATE
+
+**ClientRemotingProcessor 调用 `checkTransactionState` 进行处理：**
+
+1. **调用事务监听器回查本地事务的方法 `transactionListener.checkLocalTransaction`**
+2. **调用`endTransactionOneway` 对broker进行通知本地事务状态结果**
+
+
+
+
+
+
+
+### 总结
+
+**涉及多服务的分布式事务，不追求强一致性的情况下，可考虑使用事务消息+重试的方式尽力达到最终一致性**
+
+**使用时需要定义事务监听器执行本地事务和回查本地事务状态的方法，注意可能消费失败，重试多次后需要记录并特殊处理避免最终数据不一致**
+
+**使用事务消息时无法设置延迟级别，发送前会将延迟级别清除**
+
+**发送事务消息采用同步发送，在发送前会标记为半(事务)消息状态，在发送成功后会调用事务监听器执行本地事务，最后单向通知broker本地事务的状态**
+
+**broker存储半（事务）消息前会更改它的topic、queueId，将其持久化到事务（半消息）topic中，以此来达到暂时不可以被消费的目的**
+
+**broker接收本地事务状态通知时，如果是commit状态则将半（事务）消息重投入原始topic、队列中，以此来达到可以进行消费的目的，并且删除半（事务）消息，rollback状态也会删除半（事务）消息，只有未知状态的情况下不删除，等待后续触发回查机制**
+
+**broker使用组件定期遍历事务（半消息）topic下的所有队列检查是否需要进行回查，遍历队列时循环取出半（事务）消息，如果超过检查最大次数（15）或超时（72h），则会丢弃消息；否则会将半（事务）消息放回队列，当事务消息超过6s时会触发回查机制，向produce发送检查事务状态的请求**
+
+**produce收到回查请求后，调用事务监听器的检查事务状态方法，并又调用单向通知broker本地事务状态**
+
+
+
+#### 最后（点赞、收藏、关注求求啦\~）
+
+我是菜菜，热爱技术交流、分享与写作，喜欢图文并茂、通俗易懂的输出知识
+
+本篇文章被收入专栏 [消息中间件](https://juejin.cn/column/7405771885327892532)，感兴趣的同学可以持续关注喔
+
+本篇文章笔记以及案例被收入 [Gitee-CaiCaiJava](https://gitee.com/tcl192243051/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)、 [Github-CaiCaiJava](https://github.com/Tc-liang/CaiCaiJava/tree/master/MQ/SpringBoot-RocketMQ/src/main/java/com/caicai/springbootrocketmq)，除此之外还有更多Java进阶相关知识，感兴趣的同学可以star持续关注喔\~
+
+有什么问题可以在评论区交流，如果觉得菜菜写的不错，可以点赞、关注、收藏支持一下\~
+
+关注菜菜，分享更多技术干货，公众号：菜菜的后端私房菜
 
 ## 末尾
 
