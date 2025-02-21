@@ -1,24 +1,38 @@
 ## 菜菜的Java进阶之路🚀
 
-### 简介 ✨
+😁你好呀！我是菜菜，热爱技术交流、分享与写作，喜欢图文并茂、通俗易懂的输出知识
 
-菜菜的Java进阶之路：记录Java进阶相关知识、笔记以及案例，包括：JVM、并发编程、MySQL进阶、常用中间件等😆
+📚你可以在这找到Java技术栈进阶的相关知识：Java并发编程与JVM原理、Spring和MyBatis等常用框架及Tomcat服务器的源码解析，以及MySQL、Redis数据库的进阶知识，同时还提供关于消息中间件和网络框架Netty等主题的系列文章，都以通俗易懂的方式探讨这些复杂的技术点
 
-笔记内容干货满满 😄
+🏆除此之外，我还是掘金优秀创作者、腾讯云年度影响力作者、华为云年度十佳博主....
 
-思维导图方便复习 😝
+👫我对技术交流、知识分享以及写作充满热情，如果你愿意，欢迎加我一起交流（vx:CaiCaiJava666），也可以持续关注我的公众号：菜菜的后端私房菜
 
-内容会持续更新~  :kissing_heart: 
-
-觉得不错可以点个Star ⭐️ 
-
-目前JVM、并发编程、MySQL进阶等大部分内容已经更新，常用中间件正在持续更新  🥰
-
-
+⭐️我会分享更多技术干货，期待与更多志同道合的朋友携手并进，觉得不错可以点个Star持续关注
 
 ### 章节说明
 
-#### 深入浅出Java虚拟机 🖥️
+
+
+
+
+#### 深入浅出Java并发编程:boom: 
+
+- JavaConcurrentProgramming：案例源码
+
+- 笔记📔
+
+  - PDF笔记：菜菜的Java进阶之路🚀深入浅出构建Java并发编程知识体系.pdf🎉
+
+  - 思维导图：菜菜的Java进阶之路🚀深入浅出构建Java并发编程知识体系（.pos 使用ProcessOn打开，.xmind使用XMind打开）
+
+    ![深入浅出Java并发编程](README.assets/image-20240304221002296.png)
+
+
+
+
+
+#### 深入浅出Java虚拟机🖥️
 
 - JavaVirtualMachineHotSpot： 案例源码
 
@@ -53,19 +67,16 @@
 
   
 
-  
+#### Effective Java🛩️
 
-#### 深入浅出Java并发编程:boom: 
-
-- JavaConcurrentProgramming：案例源码
-
+- EffectiveJava：案例源码
 - 笔记📔
+  - PDF笔记：菜菜的Java进阶之路🚀EffectiveJava.pdf
+  - 思维导图：菜菜的Java进阶之路🚀EffectiveJava.pos
 
-  - PDF笔记：菜菜的Java进阶之路🚀深入浅出构建Java并发编程知识体系.pdf🎉
+![image-20240416164506366](README.assets/image-20240416164506366.png)
 
-  - 思维导图：菜菜的Java进阶之路🚀深入浅出构建Java并发编程知识体系（.pos 使用ProcessOn打开，.xmind使用XMind打开）
 
-    ![深入浅出Java并发编程](README.assets/image-20240304221002296.png)
 
 
 
@@ -79,11 +90,32 @@
 
   ![image-20240305233144229](README.assets/image-20240305233144229.png)
 
-#### Effective Java 🛩️
 
-- EffectiveJava：案例源码
-- 笔记📔
-  - PDF笔记：菜菜的Java进阶之路🚀EffectiveJava.pdf
-  - 思维导图：菜菜的Java进阶之路🚀EffectiveJava.pos
 
-![image-20240416164506366](README.assets/image-20240416164506366.png)
+
+
+#### Tomcat运行原理及核心组件解析🐱
+
+笔记📔
+
+- PDF笔记：菜菜的Java进阶之路🚀Tomcat运行原理及核心组件解析🐱.pdf🎉
+
+从自顶向下解析架构到核心组件源码实现，以通俗易懂、图文结合的形式，抽丝剥茧”解密“Tomcat中间件
+
+![image-20250221144837579](README.assets/image-20250221144837579.png)
+
+
+
+
+
+#### 消息中间件🚀
+
+主要更新RocketMQ 4.X运行原理以及核心组件解析，Kafka、RabbitMQ等其他常用消息中间件持续更新~
+
+笔记📔
+
+- PDF笔记：菜菜的Java进阶之路🚀RocketMQ运行原理及核心组件解析.pdf🎉
+
+![image-20250221151525612](README.assets/image-20250221151525612.png)
+
+![image-20250221151557046](README.assets/image-20250221151557046.png)
