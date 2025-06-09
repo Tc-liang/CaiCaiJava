@@ -1,0 +1,26 @@
+// 使用proto3
+syntax = "proto3";
+
+// 指定生成 Java 文件的包名
+option java_package = "protobuf.model";
+// 指定生成的 Java 外部类名（用于包裹所有 message）
+option java_outer_classname = "ProductProto";
+package protobuf.model;
+
+// 商品信息的 protobuf 定义
+message Product {
+  // 商品唯一标识
+  int32 id = 1;
+
+  // 商品名称
+  string name = 2;
+
+  // 商品描述
+  string description = 3;
+
+  // 商品价格，单位为分（避免浮点误差）
+  int32 price = 4;
+
+  // 商品是否上架
+  bool available = 5;
+}

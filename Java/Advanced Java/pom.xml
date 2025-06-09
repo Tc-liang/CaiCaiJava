@@ -27,6 +27,55 @@
             <artifactId>spring-core</artifactId>
             <version>5.2.25.RELEASE</version>
         </dependency>
+
+        <!-- Protobuf runtime -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>3.25.3</version>
+        </dependency>
+
+        <!-- Jackson JSON -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.17.0</version>
+        </dependency>
     </dependencies>
 
+    <build>
+        <!-- Maven 构建配置 -->
+        <plugins>
+            <!-- 执行自定义构建任务 -->
+            <plugin>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <!-- 执行配置：生成 Protobuf 的 Java 源代码 -->
+                    <execution>
+                        <id>generate-protobuf-sources</id>
+                        <!-- 绑定到 Maven 生命周期的 generate-sources 阶段 -->
+                        <phase>generate-sources</phase>
+                        <configuration>
+                            <target>
+                                <!-- 执行 protoc 编译器生成 Java 代码 -->
+                                <exec executable="D:\protobuf\bin\protoc.exe">
+                                    <!-- 指定 proto 文件搜索路径 -->
+                                    <arg value="--proto_path=src/main/java/protobuf/proto"/>
+                                    <!-- 指定 Java 输出目录 -->
+                                    <arg value="--java_out=src/main/java"/>
+                                    <!-- 列出需要编译的 .proto 文件 -->
+                                    <arg value="src/main/java/protobuf/proto/Product.proto"/>
+                                </exec>
+                            </target>
+                        </configuration>
+                        <goals>
+                            <!-- 在 run 目标下执行 -->
+                            <goal>run</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 </project>
